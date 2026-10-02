@@ -1,9 +1,9 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { useToast } from "../components/Toast";
 import { api } from "../utils/api";
 import { getMinDate } from "../utils/validators";
-import { LuPlus, LuX, LuLoader } from "react-icons/lu";
+import { LuPlus, LuX, LuLoader, LuBuilding } from "react-icons/lu";
 import VenueMap from "../components/VenueMap";
 
 export default function CreateEvent() {
@@ -11,9 +11,13 @@ export default function CreateEvent() {
   const navigate = useNavigate();
   const [submitting, setSubmitting] = useState(false);
   const [zoneInput, setZoneInput] = useState("");
+  const [venues, setVenues] = useState([]);
+  const [selectedVenueMode, setSelectedVenueMode] = useState("select"); // 'select' | 'custom'
+
   const [form, setForm] = useState({
     name: "",
     venue: "",
+    venue_id: null,
     event_date: "",
     start_time: "",
     end_time: "",
@@ -28,9 +32,44 @@ export default function CreateEvent() {
   const [showModal, setShowModal] = useState(false);
   const [showMap, setShowMap] = useState(false);
 
+  useEffect(() => {
+    api.get("/api/venues")
+      .then((data) => {
+        setVenues(data.venues || []);
+      })
+      .catch(() => {
+        // Venues optional
+      });
+  }, []);
+
   const updateField = (field, value) => {
     setForm((prev) => ({ ...prev, [field]: value }));
     setErrors((prev) => ({ ...prev, [field]: null }));
+  };
+
+  const handleVenueSelect = (venueId) => {
+    if (venueId === "custom") {
+      setSelectedVenueMode("custom");
+      setForm((prev) => ({
+        ...prev,
+        venue_id: null,
+        venue: "",
+        location_address: "",
+      }));
+    } else {
+      setSelectedVenueMode("select");
+      const v = venues.find((item) => item.id === venueId);
+      if (v) {
+        setForm((prev) => ({
+          ...prev,
+          venue_id: v.id,
+          venue: v.name,
+          location_address: v.address || prev.location_address,
+          capacity: v.default_capacity ? String(v.default_capacity) : prev.capacity,
+        }));
+        setErrors((prev) => ({ ...prev, venue: null }));
+      }
+    }
   };
 
   const addZone = () => {
@@ -63,15 +102,8 @@ export default function CreateEvent() {
     if (form.start_time) {
       const [h, m] = form.start_time.split(":").map(Number);
       const minEnd = new Date();
-      minEnd.setHours(h, m + 5, 0, 0);
+      minEnd.setHours(h, m + 15, 0, 0);
       return `${String(minEnd.getHours()).padStart(2, "0")}:${String(minEnd.getMinutes()).padStart(2, "0")}`;
-    }
-    if (!form.event_date) return "";
-    const selectedDate = new Date(form.event_date);
-    const now = new Date();
-    if (selectedDate.toDateString() === now.toDateString()) {
-      now.setMinutes(now.getMinutes() + 7);
-      return `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
     }
     return "";
   };
@@ -80,26 +112,31 @@ export default function CreateEvent() {
     const newErrors = {};
     if (!form.name.trim()) newErrors.name = "Event name is required";
     if (!form.organizer_name.trim()) newErrors.organizer_name = "Organizer name is required";
-    if (!form.venue.trim()) newErrors.venue = "Venue is required";
-    if (!form.event_date) newErrors.event_date = "Date is required";
+    if (!form.venue.trim()) newErrors.venue = "Venue name is required";
+    if (!form.event_date) newErrors.event_date = "Event date is required";
     if (form.event_date && form.event_date < getMinDate()) {
       newErrors.event_date = "Event date cannot be in the past";
     }
 
-    if (form.start_time) {
+    // Mandatory start_time and end_time validation
+    if (!form.start_time) {
+      newErrors.start_time = "Start time is mandatory";
+    } else {
       const selectedDate = form.event_date ? new Date(form.event_date) : null;
       const now = new Date();
       if (selectedDate && selectedDate.toDateString() === now.toDateString()) {
         const [startH, startM] = form.start_time.split(":").map(Number);
         const startMinutes = startH * 60 + startM;
         const nowMinutes = now.getHours() * 60 + now.getMinutes();
-        if (startMinutes < nowMinutes + 2) {
-          newErrors.start_time = "Start time must be at least 2 minutes from now";
+        if (startMinutes < nowMinutes) {
+          newErrors.start_time = "Start time cannot be in the past";
         }
       }
     }
 
-    if (form.start_time && form.end_time) {
+    if (!form.end_time) {
+      newErrors.end_time = "End time is mandatory";
+    } else if (form.start_time) {
       const [startH, startM] = form.start_time.split(":").map(Number);
       const [endH, endM] = form.end_time.split(":").map(Number);
       const startMinutes = startH * 60 + startM;
@@ -107,21 +144,11 @@ export default function CreateEvent() {
 
       if (endMinutes <= startMinutes) {
         newErrors.end_time = "End time must be after start time";
-      } else if (endMinutes < startMinutes + 5) {
-        newErrors.end_time = "End time must be at least 5 minutes after start time";
-      }
-    } else if (form.end_time && !form.start_time) {
-      const selectedDate = form.event_date ? new Date(form.event_date) : null;
-      const now = new Date();
-      if (selectedDate && selectedDate.toDateString() === now.toDateString()) {
-        const [endH, endM] = form.end_time.split(":").map(Number);
-        const endMinutes = endH * 60 + endM;
-        const nowMinutes = now.getHours() * 60 + now.getMinutes();
-        if (endMinutes < nowMinutes + 7) {
-          newErrors.end_time = "End time must be at least 7 minutes from now";
-        }
+      } else if (endMinutes < startMinutes + 15) {
+        newErrors.end_time = "Event duration must be at least 15 minutes";
       }
     }
+
     setErrors(newErrors);
     return Object.keys(newErrors).length === 0;
   };
@@ -133,7 +160,6 @@ export default function CreateEvent() {
     if (form.zones.length > 0) {
       setShowModal(true);
     } else {
-      // If no zones, just create normally
       createEvent(null);
     }
   };
@@ -145,12 +171,12 @@ export default function CreateEvent() {
         ...form,
         capacity: form.capacity ? parseInt(form.capacity, 10) : 0,
         event_date: form.event_date + "T00:00:00Z",
+        venue_id: form.venue_id || null,
       };
       
       const res = await api.post("/api/events/", payload);
       const newEventId = res.event.id;
 
-      // If they chose a custom layout, save it now before redirecting
       if (customLayout) {
         await api.post(`/api/venue-map/${newEventId}/layout`, { layout: customLayout });
       }
@@ -168,7 +194,7 @@ export default function CreateEvent() {
 
   const handleAutoSetup = () => {
     setShowModal(false);
-    createEvent(null); // Passing null will just use the default equal division
+    createEvent(null);
   };
 
   const handleManualSetup = () => {
@@ -183,7 +209,7 @@ export default function CreateEvent() {
           <h1>Finalize Zone Layout</h1>
         </div>
         <p style={{ color: "var(--text-secondary)", marginBottom: "20px" }}>
-          You have chosen to manually size your zones. Once you click "Save & Create Event", this layout will be permanently locked for this event.
+          You have chosen to manually size your zones. Once you click "Save Layout", this layout will be saved for this event.
         </p>
         
         <div className="card">
@@ -193,7 +219,7 @@ export default function CreateEvent() {
              mode="create-event"
              onExitEditMode={(layout) => {
                if (layout) createEvent(layout);
-               else setShowMap(false); // If they somehow cancel, though we removed cancel button
+               else setShowMap(false);
              }}
           />
         </div>
@@ -228,21 +254,52 @@ export default function CreateEvent() {
             <textarea id="event-desc" className="form-textarea" placeholder="Describe the event, its theme, and what attendees can expect..." value={form.description} onChange={(e) => updateField("description", e.target.value)} />
           </div>
 
+          {/* Venue Binding Dropdown & Address */}
           <div className="form-row">
             <div className="form-group">
-              <label className="form-label" htmlFor="event-venue">Venue *</label>
-              <input id="event-venue" type="text" className={`form-input ${errors.venue ? "error" : ""}`} placeholder="Convention Center Hall A" value={form.venue} onChange={(e) => updateField("venue", e.target.value)} />
+              <label className="form-label" htmlFor="venue-select">
+                <LuBuilding size={14} style={{ display: "inline", marginRight: "4px" }} />
+                Select Venue *
+              </label>
+              <select
+                id="venue-select"
+                className="form-select"
+                value={selectedVenueMode === "custom" ? "custom" : (form.venue_id || "")}
+                onChange={(e) => handleVenueSelect(e.target.value)}
+              >
+                <option value="">-- Choose Venue or Custom --</option>
+                {venues.map((v) => (
+                  <option key={v.id} value={v.id}>
+                    {v.name} {v.address ? `(${v.address})` : ""}
+                  </option>
+                ))}
+                <option value="custom">+ Enter Custom Venue</option>
+              </select>
+            </div>
+
+            <div className="form-group">
+              <label className="form-label" htmlFor="event-venue">Venue Name *</label>
+              <input 
+                id="event-venue" 
+                type="text" 
+                className={`form-input ${errors.venue ? "error" : ""}`} 
+                placeholder="Convention Center Hall A" 
+                value={form.venue} 
+                onChange={(e) => updateField("venue", e.target.value)} 
+              />
               {errors.venue && <p className="form-error">{errors.venue}</p>}
             </div>
-            <div className="form-group">
-              <label className="form-label" htmlFor="event-address">Address</label>
-              <input id="event-address" type="text" className="form-input" placeholder="123 Main Street, City" value={form.location_address} onChange={(e) => updateField("location_address", e.target.value)} />
-            </div>
+          </div>
+
+          <div className="form-group">
+            <label className="form-label" htmlFor="event-address">Venue Address</label>
+            <input id="event-address" type="text" className="form-input" placeholder="123 Main Street, City" value={form.location_address} onChange={(e) => updateField("location_address", e.target.value)} />
           </div>
         </div>
 
+        {/* Schedule: Mandatory Date, Start Time & End Time */}
         <div className="card" style={{ marginBottom: "20px" }}>
-          <h3 className="card-title" style={{ marginBottom: "20px" }}>Schedule</h3>
+          <h3 className="card-title" style={{ marginBottom: "20px" }}>Schedule (Mandatory)</h3>
 
           <div className="form-group">
             <label className="form-label" htmlFor="event-date">Event Date *</label>
@@ -252,12 +309,12 @@ export default function CreateEvent() {
 
           <div className="form-row">
             <div className="form-group">
-              <label className="form-label" htmlFor="event-start">Start Time</label>
+              <label className="form-label" htmlFor="event-start">Start Time *</label>
               <input id="event-start" type="time" className={`form-input ${errors.start_time ? "error" : ""}`} min={getMinStartTime()} value={form.start_time} onChange={(e) => updateField("start_time", e.target.value)} />
               {errors.start_time && <p className="form-error">{errors.start_time}</p>}
             </div>
             <div className="form-group">
-              <label className="form-label" htmlFor="event-end">End Time</label>
+              <label className="form-label" htmlFor="event-end">End Time *</label>
               <input id="event-end" type="time" className={`form-input ${errors.end_time ? "error" : ""}`} min={getMinEndTime()} value={form.end_time} onChange={(e) => updateField("end_time", e.target.value)} />
               {errors.end_time && <p className="form-error">{errors.end_time}</p>}
             </div>
@@ -320,7 +377,7 @@ export default function CreateEvent() {
             <p style={{ color: "var(--text-secondary)", marginBottom: "24px", lineHeight: "1.5" }}>
               You have added zones to this event. How would you like them mapped out in the stadium? 
               <br /><br />
-              <strong>Note: Once created, zone layouts cannot be altered later.</strong>
+              <strong>Note: You can further refine spatial coordinates in the vector map editor.</strong>
             </p>
             <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
               <button className="btn btn-primary btn-lg" onClick={handleAutoSetup}>

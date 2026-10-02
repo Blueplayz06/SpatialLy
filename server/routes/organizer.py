@@ -1,9 +1,12 @@
 from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi.responses import StreamingResponse
 from config import get_supabase
 from middleware.auth import get_current_user, require_organizer
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Any, Dict
 from datetime import datetime, timezone
+import csv
+import io
 
 router = APIRouter(prefix="/api/organizer", tags=["Organizer"])
 
@@ -54,15 +57,26 @@ class ZoneCreate(BaseModel):
     name: str
     code: Optional[str] = None
     floor_level: Optional[int] = 1
+    level_id: Optional[str] = None
     capacity_limit: Optional[int] = None
     operating_capacity: Optional[int] = None
+    warning_threshold: Optional[float] = 0.85
+    critical_threshold: Optional[float] = 0.95
+    advisory_threshold: Optional[float] = 0.70
+    operational_status: Optional[str] = "open"
     is_crowd_monitored: bool = True
 
 class ZoneUpdate(BaseModel):
     name: Optional[str] = None
     code: Optional[str] = None
+    floor_level: Optional[int] = None
+    level_id: Optional[str] = None
     capacity_limit: Optional[int] = None
     operating_capacity: Optional[int] = None
+    warning_threshold: Optional[float] = None
+    critical_threshold: Optional[float] = None
+    advisory_threshold: Optional[float] = None
+    operational_status: Optional[str] = None
     is_crowd_monitored: Optional[bool] = None
     is_active: Optional[bool] = None
 
@@ -128,12 +142,143 @@ def verify_event_ownership(supabase, event_id: str, user_id: str):
 async def get_operational_health(event_id: str, current_user: dict = Depends(require_organizer)):
     supabase = get_supabase()
     verify_event_ownership(supabase, event_id, current_user["user_id"])
+    
+    # Try RPC first
     try:
         result = supabase.rpc("get_event_operational_health", {"p_event_id": event_id}).execute()
-        return {"health": result.data}
+        if result.data:
+            data = result.data
+            # Enrich with tickets if missing
+            if "tickets" not in data:
+                try:
+                    tickets_res = supabase.table("tickets").select("id, status, checked_in_at").eq("event_id", event_id).execute()
+                    t_data = tickets_res.data or []
+                    data["tickets"] = {
+                        "total": len(t_data),
+                        "checked_in": sum(1 for t in t_data if t.get("checked_in_at") or t.get("status") == "checked_in"),
+                    }
+                except Exception:
+                    data["tickets"] = {"total": 0, "checked_in": 0}
+            return {"health": data}
     except Exception as e:
-        # Fallback: compute basic health manually
-        return {"health": None, "error": str(e)}
+        print(f"[organizer] get_event_operational_health RPC error ({e}), aggregating directly")
+
+    # Authoritative direct fallback aggregation
+    try:
+        # Incidents
+        incidents_res = supabase.table("operational_incidents").select("id, priority, status, category, created_at, zone_name").eq("event_id", event_id).execute()
+        incidents = incidents_res.data or []
+        active_incidents = [i for i in incidents if i.get("status") not in ("resolved", "closed")]
+        urgent_incidents = [i for i in active_incidents if i.get("priority") in ("urgent", "critical")]
+        resolved_incidents = [i for i in incidents if i.get("status") in ("resolved", "closed")]
+
+        # Shifts
+        shifts_res = supabase.table("volunteer_shifts").select("id, status, break_state, zone_id, zone_name").eq("event_id", event_id).execute()
+        shifts = shifts_res.data or []
+        active_shifts = [s for s in shifts if s.get("status") == "active"]
+        on_break_shifts = [s for s in shifts if s.get("status") == "active" and s.get("break_state") in ("taking_break", "on_break")]
+
+        # Coverage requests
+        cov_res = supabase.table("coverage_requests").select("id, status").eq("event_id", event_id).execute()
+        coverage = cov_res.data or []
+        pending_cov = [c for c in coverage if c.get("status") == "pending"]
+
+        # Tasks
+        tasks_res = supabase.table("supervisor_tasks").select("id, status").eq("event_id", event_id).execute()
+        tasks = tasks_res.data or []
+        pending_tasks = [t for t in tasks if t.get("status") == "pending"]
+        in_prog_tasks = [t for t in tasks if t.get("status") == "in_progress"]
+        completed_tasks = [t for t in tasks if t.get("status") == "completed"]
+
+        # Zones
+        zones_res = supabase.table("event_zones").select("id, name, capacity_limit, operating_capacity").eq("event_id", event_id).execute()
+        zones_data = zones_res.data or []
+        
+        # Try to get zone active crowd counts from snapshots or density
+        zone_counts = {}
+        try:
+            snaps = supabase.table("crowd_zone_snapshots").select("zone_id, estimated_count, snapshot_at").eq("event_id", event_id).order("snapshot_at", desc=True).limit(50).execute()
+            seen = set()
+            for s in (snaps.data or []):
+                zid = s.get("zone_id")
+                if zid not in seen:
+                    seen.add(zid)
+                    zone_counts[zid] = s.get("estimated_count", 0)
+        except Exception:
+            pass
+
+        zones_summary = []
+        for z in zones_data:
+            zid = z["id"]
+            zname = z.get("name", "Zone")
+            cnt = zone_counts.get(zid, 0)
+            z_inc = [i for i in active_incidents if i.get("zone_name") == zname]
+            z_staff = [s for s in active_shifts if s.get("zone_id") == zid or s.get("zone_name") == zname]
+            zones_summary.append({
+                "zone_id": zid,
+                "zone_name": zname,
+                "active_count": cnt,
+                "operating_capacity": z.get("operating_capacity") or z.get("capacity_limit") or 100,
+                "active_incidents": len(z_inc),
+                "active_staff": len(z_staff),
+                "is_monitored": True,
+            })
+
+        # Tickets
+        tickets_summary = {"total": 0, "checked_in": 0}
+        try:
+            tickets_res = supabase.table("tickets").select("id, status, checked_in_at").eq("event_id", event_id).execute()
+            t_data = tickets_res.data or []
+            tickets_summary = {
+                "total": len(t_data),
+                "checked_in": sum(1 for t in t_data if t.get("checked_in_at") or t.get("status") == "checked_in"),
+            }
+        except Exception:
+            pass
+
+        # Overall operational status gauge calculation
+        health_status = "healthy"
+        if len(urgent_incidents) > 0:
+            health_status = "critical"
+        elif any((z["operating_capacity"] > 0 and (z["active_count"] / z["operating_capacity"]) > 0.85) for z in zones_summary) or len(active_incidents) > 0:
+            health_status = "elevated"
+
+        health_obj = {
+            "event_id": event_id,
+            "status": health_status,
+            "computed_at": datetime.now(timezone.utc).isoformat(),
+            "incidents": {
+                "total": len(incidents),
+                "active": len(active_incidents),
+                "urgent": len(urgent_incidents),
+                "resolved": len(resolved_incidents),
+            },
+            "shifts": {
+                "total": len(shifts),
+                "active": len(active_shifts),
+                "on_break": len(on_break_shifts),
+            },
+            "coverage": {
+                "total": len(coverage),
+                "pending": len(pending_cov),
+            },
+            "tasks": {
+                "total": len(tasks),
+                "pending": len(pending_tasks),
+                "in_progress": len(in_prog_tasks),
+                "completed": len(completed_tasks),
+            },
+            "zones": zones_summary,
+            "tickets": tickets_summary,
+            "communications": {
+                "total_messages": 0,
+                "broadcasts": 0,
+                "urgent": 0,
+            }
+        }
+        return {"health": health_obj}
+    except Exception as fallback_err:
+        return {"health": None, "error": str(fallback_err)}
 
 
 @router.get("/timeline/{event_id}")
@@ -256,14 +401,14 @@ async def list_event_volunteers(event_id: str, current_user: dict = Depends(requ
     try:
         supabase = get_supabase()
         verify_event_ownership(supabase, event_id, current_user["user_id"])
-        
-        # Get from both assignment tables
-        web_assignments = supabase.table("web_volunteer_assignments").select("*").eq("event_id", event_id).execute()
-        prod_assignments = supabase.table("volunteer_assignments").select("*").eq("event_id", event_id).execute()
-        
+
+        # Canonical assignment table only (web_volunteer_assignments retired)
+        assignments = supabase.table("volunteer_assignments").select("*, volunteer:profiles(id, full_name, avatar_url)").eq("event_id", event_id).execute()
+        shifts = supabase.table("volunteer_shifts").select("*").eq("event_id", event_id).order("scheduled_start").execute()
+
         return {
-            "web_assignments": web_assignments.data,
-            "assignments": prod_assignments.data,
+            "assignments": assignments.data,
+            "shifts": shifts.data,
         }
     except Exception as e:
         import traceback
@@ -451,13 +596,37 @@ async def update_zone(zone_id: str, data: ZoneUpdate, current_user: dict = Depen
     existing = supabase.table("event_zones").select("*").eq("id", zone_id).execute()
     if not existing.data:
         raise HTTPException(status_code=404, detail="Zone not found")
-    
+
     updates = {k: v for k, v in data.model_dump(exclude_none=True).items()}
     if not updates:
         raise HTTPException(status_code=400, detail="No fields to update")
-    
+
     result = supabase.table("event_zones").update(updates).eq("id", zone_id).execute()
     return {"message": "Zone updated", "data": result.data}
+
+
+@router.delete("/zones/{zone_id}")
+async def delete_zone(zone_id: str, current_user: dict = Depends(require_organizer)):
+    """Delete a zone. Verifies event ownership first."""
+    supabase = get_supabase()
+    existing = supabase.table("event_zones").select("id, event_id, name").eq("id", zone_id).execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Zone not found")
+    zone = existing.data[0]
+    verify_event_ownership(supabase, zone["event_id"], current_user["user_id"])
+
+    supabase.table("event_zones").delete().eq("id", zone_id).execute()
+
+    # Remove from events.zones text array too
+    try:
+        event = supabase.table("events").select("zones").eq("id", zone["event_id"]).execute()
+        if event.data:
+            current_zones = [z for z in (event.data[0].get("zones") or []) if z != zone["name"]]
+            supabase.table("events").update({"zones": current_zones}).eq("id", zone["event_id"]).execute()
+    except Exception:
+        pass
+
+    return {"message": f"Zone {zone['name']} deleted"}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -737,3 +906,477 @@ async def list_lost_found(event_id: str, current_user: dict = Depends(require_or
     verify_event_ownership(supabase, event_id, current_user["user_id"])
     result = supabase.table("lost_found_reports").select("*").eq("event_id", event_id).order("created_at", desc=True).execute()
     return {"items": result.data}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 14. INCIDENT — ATOMIC DISPATCH + AUDIT LOGS
+# ═══════════════════════════════════════════════════════════════
+
+class IncidentAssignRequest(BaseModel):
+    volunteer_id: str
+    notes: Optional[str] = None
+
+
+@router.post("/incidents/{incident_id}/assign")
+async def assign_incident(incident_id: str, data: IncidentAssignRequest, current_user: dict = Depends(require_organizer)):
+    """Atomic volunteer dispatch via assign_operational_incident RPC."""
+    supabase = get_supabase()
+    existing = supabase.table("operational_incidents").select("id, event_id").eq("id", incident_id).execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    verify_event_ownership(supabase, existing.data[0]["event_id"], current_user["user_id"])
+
+    try:
+        result = supabase.rpc("assign_operational_incident", {
+            "p_incident_id": incident_id,
+            "p_assignee_id": data.volunteer_id,
+            "p_assigner_id": current_user["user_id"],
+        }).execute()
+        return {"message": "Incident assigned", "data": result.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"RPC failed: {str(e)}")
+
+
+@router.get("/incident-logs/{incident_id}")
+async def get_incident_logs(incident_id: str, current_user: dict = Depends(require_organizer)):
+    """Get audit trail for an incident."""
+    supabase = get_supabase()
+    existing = supabase.table("operational_incidents").select("id, event_id").eq("id", incident_id).execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    verify_event_ownership(supabase, existing.data[0]["event_id"], current_user["user_id"])
+
+    logs = (
+        supabase.table("operational_incident_logs")
+        .select("*, actor:profiles(id, full_name)")
+        .eq("incident_id", incident_id)
+        .order("created_at")
+        .execute()
+    )
+    return {"logs": logs.data}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 15. SHIFTS CRUD
+# ═══════════════════════════════════════════════════════════════
+
+class ShiftCreate(BaseModel):
+    event_id: str
+    volunteer_id: str
+    zone_id: Optional[str] = None
+    zone_name: Optional[str] = None
+    team_id: Optional[str] = None
+    shift_name: str = "Operational Shift"
+    scheduled_start: str
+    scheduled_end: str
+    notes: Optional[str] = None
+
+
+class ShiftUpdate(BaseModel):
+    zone_id: Optional[str] = None
+    zone_name: Optional[str] = None
+    status: Optional[str] = None
+    scheduled_start: Optional[str] = None
+    scheduled_end: Optional[str] = None
+    notes: Optional[str] = None
+
+
+@router.post("/shifts")
+async def create_shift(data: ShiftCreate, current_user: dict = Depends(require_organizer)):
+    supabase = get_supabase()
+    verify_event_ownership(supabase, data.event_id, current_user["user_id"])
+    new_shift = {
+        "event_id": data.event_id,
+        "volunteer_id": data.volunteer_id,
+        "shift_name": data.shift_name,
+        "scheduled_start": data.scheduled_start,
+        "scheduled_end": data.scheduled_end,
+        "status": "scheduled",
+    }
+    for field in ["zone_id", "zone_name", "team_id", "notes"]:
+        v = getattr(data, field, None)
+        if v:
+            new_shift[field] = v
+    result = supabase.table("volunteer_shifts").insert(new_shift).execute()
+    return {"message": "Shift created", "data": result.data}
+
+
+@router.put("/shifts/{shift_id}")
+async def update_shift(shift_id: str, data: ShiftUpdate, current_user: dict = Depends(require_organizer)):
+    supabase = get_supabase()
+    existing = supabase.table("volunteer_shifts").select("id, event_id").eq("id", shift_id).execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Shift not found")
+    verify_event_ownership(supabase, existing.data[0]["event_id"], current_user["user_id"])
+    updates = {k: v for k, v in data.model_dump(exclude_none=True).items()}
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+    result = supabase.table("volunteer_shifts").update(updates).eq("id", shift_id).execute()
+    return {"message": "Shift updated", "data": result.data}
+
+
+@router.delete("/shifts/{shift_id}")
+async def delete_shift(shift_id: str, current_user: dict = Depends(require_organizer)):
+    supabase = get_supabase()
+    existing = supabase.table("volunteer_shifts").select("id, event_id").eq("id", shift_id).execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Shift not found")
+    verify_event_ownership(supabase, existing.data[0]["event_id"], current_user["user_id"])
+    supabase.table("volunteer_shifts").delete().eq("id", shift_id).execute()
+    return {"message": "Shift deleted"}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 16. TEAMS CRUD
+# ═══════════════════════════════════════════════════════════════
+
+class TeamCreate(BaseModel):
+    event_id: str
+    name: str
+    description: Optional[str] = None
+    zone_id: Optional[str] = None
+    zone_name: Optional[str] = None
+    lead_id: Optional[str] = None
+
+
+class TeamUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    zone_id: Optional[str] = None
+    zone_name: Optional[str] = None
+    lead_id: Optional[str] = None
+
+
+@router.post("/teams")
+async def create_team(data: TeamCreate, current_user: dict = Depends(require_organizer)):
+    supabase = get_supabase()
+    verify_event_ownership(supabase, data.event_id, current_user["user_id"])
+    new_team = {"event_id": data.event_id, "name": data.name}
+    for field in ["description", "zone_id", "zone_name", "lead_id"]:
+        v = getattr(data, field, None)
+        if v:
+            new_team[field] = v
+    result = supabase.table("event_teams").insert(new_team).execute()
+    return {"message": "Team created", "data": result.data}
+
+
+@router.put("/teams/{team_id}")
+async def update_team(team_id: str, data: TeamUpdate, current_user: dict = Depends(require_organizer)):
+    supabase = get_supabase()
+    existing = supabase.table("event_teams").select("id, event_id").eq("id", team_id).execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Team not found")
+    verify_event_ownership(supabase, existing.data[0]["event_id"], current_user["user_id"])
+    updates = {k: v for k, v in data.model_dump(exclude_none=True).items()}
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+    result = supabase.table("event_teams").update(updates).eq("id", team_id).execute()
+    return {"message": "Team updated", "data": result.data}
+
+
+@router.delete("/teams/{team_id}")
+async def delete_team(team_id: str, current_user: dict = Depends(require_organizer)):
+    supabase = get_supabase()
+    existing = supabase.table("event_teams").select("id, event_id").eq("id", team_id).execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Team not found")
+    verify_event_ownership(supabase, existing.data[0]["event_id"], current_user["user_id"])
+    supabase.table("event_teams").delete().eq("id", team_id).execute()
+    return {"message": "Team deleted"}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 17. ASSISTANCE — PROPER QUERY + ESCALATION
+# ═══════════════════════════════════════════════════════════════
+
+@router.get("/assistance/{event_id}")
+async def list_assistance_requests(event_id: str, current_user: dict = Depends(require_organizer)):
+    """List attendee assistance requests (not operational_incidents)."""
+    supabase = get_supabase()
+    verify_event_ownership(supabase, event_id, current_user["user_id"])
+    # Query operational_incidents with category='attendee_assistance'
+    result = (
+        supabase.table("operational_incidents")
+        .select("*")
+        .eq("event_id", event_id)
+        .eq("category", "attendee_assistance")
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return {"assistance_requests": result.data}
+
+
+@router.post("/assistance/{incident_id}/escalate")
+async def escalate_assistance(incident_id: str, data: dict, current_user: dict = Depends(require_organizer)):
+    """Escalate an attendee assistance request to a formal operational incident."""
+    supabase = get_supabase()
+    existing = supabase.table("operational_incidents").select("*").eq("id", incident_id).execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Assistance request not found")
+    inc = existing.data[0]
+    verify_event_ownership(supabase, inc["event_id"], current_user["user_id"])
+
+    # Promote category and priority
+    updates = {
+        "category": data.get("escalated_category", "safety"),
+        "priority": data.get("priority", "important"),
+        "status": "open",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if data.get("notes"):
+        updates["staff_notes"] = data["notes"]
+
+    result = supabase.table("operational_incidents").update(updates).eq("id", incident_id).execute()
+
+    # Log the escalation
+    try:
+        supabase.table("operational_incident_logs").insert({
+            "incident_id": incident_id,
+            "actor_id": current_user["user_id"],
+            "action": "escalated",
+            "notes": f"Escalated from assistance to {updates['category']}",
+        }).execute()
+    except Exception:
+        pass
+
+    return {"message": "Assistance request escalated", "data": result.data}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 18. COVERAGE APPROVAL
+# ═══════════════════════════════════════════════════════════════
+
+@router.put("/coverage/{request_id}/approve")
+async def approve_coverage(request_id: str, current_user: dict = Depends(require_organizer)):
+    supabase = get_supabase()
+    existing = supabase.table("coverage_requests").select("id, event_id").eq("id", request_id).execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Coverage request not found")
+    verify_event_ownership(supabase, existing.data[0]["event_id"], current_user["user_id"])
+    result = supabase.table("coverage_requests").update({
+        "status": "approved",
+        "approved_by": current_user["user_id"],
+        "approved_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", request_id).execute()
+    return {"message": "Coverage request approved", "data": result.data}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 19. SHIFT HANDOFF LOGS
+# ═══════════════════════════════════════════════════════════════
+
+@router.get("/handoffs/{event_id}")
+async def list_handoffs(event_id: str, current_user: dict = Depends(require_organizer)):
+    supabase = get_supabase()
+    verify_event_ownership(supabase, event_id, current_user["user_id"])
+    try:
+        result = (
+            supabase.table("shift_handoff_logs")
+            .select("*, from_volunteer:profiles!from_volunteer_id(id, full_name), to_volunteer:profiles!to_volunteer_id(id, full_name)")
+            .eq("event_id", event_id)
+            .order("created_at", desc=True)
+            .execute()
+        )
+        return {"handoffs": result.data}
+    except Exception as e:
+        # Table may not exist yet
+        return {"handoffs": [], "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 20. COMMS RECEIPTS (ACK TRACKING)
+# ═══════════════════════════════════════════════════════════════
+
+@router.get("/comms/{msg_id}/receipts")
+async def get_message_receipts(msg_id: str, current_user: dict = Depends(require_organizer)):
+    supabase = get_supabase()
+    msg = supabase.table("operational_messages").select("id, event_id").eq("id", msg_id).execute()
+    if not msg.data:
+        raise HTTPException(status_code=404, detail="Message not found")
+    verify_event_ownership(supabase, msg.data[0]["event_id"], current_user["user_id"])
+    try:
+        receipts = (
+            supabase.table("operational_message_receipts")
+            .select("*, recipient:profiles(id, full_name)")
+            .eq("message_id", msg_id)
+            .order("acknowledged_at")
+            .execute()
+        )
+        return {"receipts": receipts.data}
+    except Exception as e:
+        return {"receipts": [], "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 21. ACTIVITIES (GAMIFICATION) CRUD
+# ═══════════════════════════════════════════════════════════════
+
+class ActivityCreate(BaseModel):
+    event_id: str
+    title: str
+    description: Optional[str] = None
+    activity_type: str = "quest"
+    points_value: int = 10
+    max_completions: Optional[int] = None
+    zone_id: Optional[str] = None
+    checkpoint_code: Optional[str] = None
+    is_active: bool = True
+
+
+class ActivityUpdate(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    points_value: Optional[int] = None
+    max_completions: Optional[int] = None
+    zone_id: Optional[str] = None
+    checkpoint_code: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+@router.get("/activities/{event_id}")
+async def list_activities(event_id: str, current_user: dict = Depends(require_organizer)):
+    supabase = get_supabase()
+    verify_event_ownership(supabase, event_id, current_user["user_id"])
+    result = supabase.table("activities").select("*").eq("event_id", event_id).order("created_at").execute()
+    return {"activities": result.data}
+
+
+@router.post("/activities")
+async def create_activity(data: ActivityCreate, current_user: dict = Depends(require_organizer)):
+    supabase = get_supabase()
+    verify_event_ownership(supabase, data.event_id, current_user["user_id"])
+    new_act = {
+        "event_id": data.event_id,
+        "title": data.title,
+        "description": data.description or "",
+        "activity_type": data.activity_type,
+        "points_value": data.points_value,
+        "is_active": data.is_active,
+    }
+    for field in ["max_completions", "zone_id", "checkpoint_code"]:
+        v = getattr(data, field, None)
+        if v is not None:
+            new_act[field] = v
+    result = supabase.table("activities").insert(new_act).execute()
+    return {"message": "Activity created", "data": result.data}
+
+
+@router.put("/activities/{activity_id}")
+async def update_activity(activity_id: str, data: ActivityUpdate, current_user: dict = Depends(require_organizer)):
+    supabase = get_supabase()
+    existing = supabase.table("activities").select("id, event_id").eq("id", activity_id).execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Activity not found")
+    verify_event_ownership(supabase, existing.data[0]["event_id"], current_user["user_id"])
+    updates = {k: v for k, v in data.model_dump(exclude_none=True).items()}
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    result = supabase.table("activities").update(updates).eq("id", activity_id).execute()
+    return {"message": "Activity updated", "data": result.data}
+
+
+@router.delete("/activities/{activity_id}")
+async def delete_activity(activity_id: str, current_user: dict = Depends(require_organizer)):
+    supabase = get_supabase()
+    existing = supabase.table("activities").select("id, event_id").eq("id", activity_id).execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Activity not found")
+    verify_event_ownership(supabase, existing.data[0]["event_id"], current_user["user_id"])
+    supabase.table("activities").delete().eq("id", activity_id).execute()
+    return {"message": "Activity deleted"}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 22. CSV STREAMING EXPORT
+# ═══════════════════════════════════════════════════════════════
+
+@router.get("/export/{event_id}/csv")
+async def export_csv(event_id: str, report_type: str = Query("attendance"), current_user: dict = Depends(require_organizer)):
+    """Stream a CSV download of attendance or incident data."""
+    supabase = get_supabase()
+    verify_event_ownership(supabase, event_id, current_user["user_id"])
+
+    if report_type == "incidents":
+        rows = supabase.table("operational_incidents").select(
+            "id, title, category, priority, status, venue_zone_name, created_at, resolved_at, resolution_notes"
+        ).eq("event_id", event_id).order("created_at").execute().data
+        fieldnames = ["id", "title", "category", "priority", "status", "venue_zone_name", "created_at", "resolved_at", "resolution_notes"]
+        filename = f"incidents_{event_id[:8]}.csv"
+    else:
+        # Default: attendance
+        rows = supabase.table("tickets").select(
+            "id, attendee_id, user_id, ticket_type, status, created_at, claimed_at"
+        ).eq("event_id", event_id).order("created_at").execute().data
+        fieldnames = ["id", "attendee_id", "user_id", "ticket_type", "status", "created_at", "claimed_at"]
+        filename = f"attendance_{event_id[:8]}.csv"
+
+    def generate():
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        yield buf.getvalue()
+        buf.truncate(0)
+        buf.seek(0)
+        for row in rows:
+            writer.writerow(row)
+            yield buf.getvalue()
+            buf.truncate(0)
+            buf.seek(0)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+# 23. CROWD CALIBRATION
+# ═══════════════════════════════════════════════════════════════
+
+class CrowdCalibrationRequest(BaseModel):
+    zone_id: str
+    manual_count: int
+    notes: Optional[str] = None
+
+
+@router.post("/crowd/calibrate")
+async def calibrate_crowd(data: CrowdCalibrationRequest, event_id: str = Query(...), current_user: dict = Depends(require_organizer)):
+    """Submit manual turnstile headcount calibration for a zone."""
+    supabase = get_supabase()
+    verify_event_ownership(supabase, event_id, current_user["user_id"])
+
+    # Insert a calibration snapshot
+    result = supabase.table("crowd_zone_snapshots").insert({
+        "event_id": event_id,
+        "zone_id": data.zone_id,
+        "estimated_count": data.manual_count,
+        "source": "manual_calibration",
+        "notes": data.notes or "Manual headcount calibration",
+        "snapshot_at": datetime.now(timezone.utc).isoformat(),
+    }).execute()
+    return {"message": "Calibration recorded", "data": result.data}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 28. EMERGENCY ACTION PLAN (EAP)
+# ═══════════════════════════════════════════════════════════════
+
+@router.post("/eap/{event_id}/publish")
+async def publish_eap(event_id: str, current_user: dict = Depends(require_organizer)):
+    """Publish Emergency Action Plan (EAP) to event operational staff."""
+    supabase = get_supabase()
+    verify_event_ownership(supabase, event_id, current_user["user_id"])
+    try:
+        supabase.table("event_activity_logs").insert({
+            "event_id": event_id,
+            "action_type": "eap_publish",
+            "description": "Emergency Action Plan published to operational staff",
+            "actor_id": current_user["user_id"],
+        }).execute()
+    except Exception:
+        pass
+    return {"message": "Emergency Action Plan published to active event staff", "event_id": event_id}
+

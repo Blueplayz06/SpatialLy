@@ -39,6 +39,7 @@ app.add_middleware(
 )
 
 app.include_router(events.router)
+app.include_router(events.venues_router)
 app.include_router(volunteers.router)
 app.include_router(dashboard.router)
 app.include_router(venue_map.router)

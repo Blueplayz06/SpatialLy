@@ -26,10 +26,10 @@ async def invite_bulk_volunteers(
     for vid in data.volunteer_ids:
         try:
             volunteer = (
-                supabase.table("web_users")
-                .select("*")
-                .eq("user_id", vid)
-                .eq("user_type", "volunteer")
+                supabase.table("profiles")
+                .select("id, email, full_name")
+                .eq("id", vid)
+                .eq("role", "volunteer")
                 .execute()
             )
 
@@ -95,10 +95,10 @@ async def invite_existing_volunteer(
     supabase = get_supabase()
 
     volunteer = (
-        supabase.table("web_users")
-        .select("*")
-        .eq("user_id", data.volunteer_id)
-        .eq("user_type", "volunteer")
+        supabase.table("profiles")
+        .select("id, email, full_name")
+        .eq("id", data.volunteer_id)
+        .eq("role", "volunteer")
         .execute()
     )
 
@@ -139,14 +139,14 @@ async def invite_existing_volunteer(
             supabase.table("event_invitations").update(
                 {"status": "pending"}
             ).eq("id", existing_invite.data[0]["id"]).execute()
-            return {
-                "message": f"Invitation resent to Volunteer {data.volunteer_id}",
-                "volunteer": {
-                    "user_id": volunteer.data[0]["user_id"],
-                    "full_name": volunteer.data[0].get("full_name", ""),
-                    "email": volunteer.data[0]["email"],
-                },
-            }
+        return {
+            "message": f"Invitation resent to Volunteer {data.volunteer_id}",
+            "volunteer": {
+                "user_id": volunteer.data[0]["id"],
+                "full_name": volunteer.data[0].get("full_name", ""),
+                "email": volunteer.data[0].get("email", ""),
+            },
+        }
 
     supabase.table("event_invitations").insert(
         {
@@ -182,23 +182,23 @@ async def invite_new_volunteer(
     supabase = get_supabase()
 
     existing_user = (
-        supabase.table("web_users")
-        .select("user_id, user_type")
+        supabase.table("profiles")
+        .select("id, role")
         .eq("email", data.email)
         .execute()
     )
 
     if existing_user.data:
         user = existing_user.data[0]
-        if user["user_type"] == "volunteer":
+        if user["role"] == "volunteer":
             raise HTTPException(
                 status_code=409,
-                detail=f"A volunteer account with this email already exists (ID: {user['user_id']}). Use the 'Invite by ID' option instead.",
+                detail=f"A volunteer account with this email already exists (ID: {user['id']}). Use the 'Invite by ID' option instead.",
             )
         else:
             raise HTTPException(
                 status_code=409,
-                detail=f"An account with this email already exists as a {user['user_type']}. Cannot send volunteer invitation.",
+                detail=f"An account with this email already exists as a {user['role']}. Cannot send volunteer invitation.",
             )
 
     event = supabase.table("events").select("*").eq("id", data.event_id).execute()
@@ -281,7 +281,7 @@ async def get_event_volunteers(
     supabase = get_supabase()
 
     assignments = (
-        supabase.table("web_volunteer_assignments")
+        supabase.table("volunteer_assignments")
         .select("*")
         .eq("event_id", event_id)
         .execute()
@@ -296,17 +296,18 @@ async def get_event_volunteers(
 
     volunteer_ids = set()
     for a in assignments.data:
-        volunteer_ids.add(a["volunteer_user_id"])
+        if a.get("volunteer_id"):
+            volunteer_ids.add(a["volunteer_id"])
     for i in invitations.data:
         if i.get("volunteer_user_id"):
             volunteer_ids.add(i["volunteer_user_id"])
-            
+
     volunteers = []
     if volunteer_ids:
         vols = (
-            supabase.table("web_users")
-            .select("user_id, email, full_name, nickname")
-            .in_("user_id", list(volunteer_ids))
+            supabase.table("profiles")
+            .select("id, email, full_name, avatar_url")
+            .in_("id", list(volunteer_ids))
             .execute()
         )
         volunteers = vols.data
@@ -381,21 +382,22 @@ async def accept_invitation(
     ).execute()
 
     existing = (
-        supabase.table("web_volunteer_assignments")
+        supabase.table("volunteer_assignments")
         .select("id")
-        .eq("volunteer_user_id", current_user["user_id"])
+        .eq("volunteer_id", current_user["user_id"])
         .eq("event_id", invitation["event_id"])
         .execute()
     )
 
     if not existing.data:
-        supabase.table("web_volunteer_assignments").insert(
+        supabase.table("volunteer_assignments").insert(
             {
-                "volunteer_user_id": current_user["user_id"],
+                "volunteer_id": current_user["user_id"],
                 "event_id": invitation["event_id"],
+                "status": "confirmed",
             }
         ).execute()
-        
+
         supabase.table("event_activity_logs").insert({
             "event_id": invitation["event_id"],
             "action_type": "assignment",
@@ -426,23 +428,22 @@ async def decline_invitation(
 async def search_volunteers(q: str, current_user: dict = Depends(require_organizer)):
     supabase = get_supabase()
 
-    q = q.strip().upper()
+    q_clean = q.strip()
 
-    if q.startswith("V") and q[1:].isdigit():
-        result = (
-            supabase.table("web_users")
-            .select("user_id, email, full_name, nickname")
-            .eq("user_id", q)
-            .eq("user_type", "volunteer")
-            .execute()
-        )
-    else:
-        result = (
-            supabase.table("web_users")
-            .select("user_id, email, full_name, nickname")
-            .eq("user_type", "volunteer")
-            .ilike("full_name", f"%{q}%")
-            .execute()
-        )
+    # Search profiles by full_name or email
+    result = (
+        supabase.table("profiles")
+        .select("id, email, full_name, avatar_url, role")
+        .eq("role", "volunteer")
+        .ilike("full_name", f"%{q_clean}%")
+        .limit(20)
+        .execute()
+    )
 
-    return {"volunteers": result.data}
+    # Normalize to expected shape
+    volunteers = [
+        {"user_id": v["id"], "email": v.get("email", ""), "full_name": v.get("full_name", ""), "avatar_url": v.get("avatar_url")}
+        for v in result.data
+    ]
+
+    return {"volunteers": volunteers}

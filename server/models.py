@@ -82,6 +82,7 @@ class VolunteerSignupRequest(BaseModel):
 class EventCreate(BaseModel):
     name: str
     venue: str
+    venue_id: Optional[str] = None
     event_date: str
     start_time: Optional[str] = None
     end_time: Optional[str] = None
@@ -116,6 +117,7 @@ class EventCreate(BaseModel):
 class EventUpdate(BaseModel):
     name: Optional[str] = None
     venue: Optional[str] = None
+    venue_id: Optional[str] = None
     event_date: Optional[str] = None
     start_time: Optional[str] = None
     end_time: Optional[str] = None
