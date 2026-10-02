@@ -22,18 +22,26 @@ export function AuthProvider({ children }) {
 
   useEffect(() => {
     // Check active session on mount
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      handleSession(session);
-    });
+    supabase.auth
+      .getSession()
+      .then(({ data } = {}) => {
+        handleSession(data?.session || null);
+      })
+      .catch((err) => {
+        console.warn("Failed to get session:", err);
+        setLoading(false);
+      });
 
     // Listen for auth state changes
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(
-      (_event, session) => {
+    try {
+      const { data } = supabase.auth.onAuthStateChange((_event, session) => {
         handleSession(session);
-      }
-    );
+      });
 
-    return () => subscription.unsubscribe();
+      return () => data?.subscription?.unsubscribe?.();
+    } catch (err) {
+      console.warn("Failed to subscribe to auth state changes:", err);
+    }
   }, []);
 
   const login = async (email, password) => {

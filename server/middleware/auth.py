@@ -21,22 +21,31 @@ async def get_current_user(
     if not user:
         raise HTTPException(status_code=401, detail="Account not found in Supabase Auth")
 
-    # Check if they exist in web_users (migrated users or web signups)
-    result = supabase.table("web_users").select("*").eq("id", user.id).execute()
+    # Check if they exist in canonical profiles table
+    profile_data = {}
+    try:
+        profile_res = supabase.table("profiles").select("*").eq("id", user.id).execute()
+        if profile_res.data and len(profile_res.data) > 0:
+            profile_data = profile_res.data[0]
+    except Exception:
+        # Table might not exist or connection error; fall through to metadata
+        pass
 
-    if not result.data:
-        # User exists in Supabase Auth but not web_users (e.g., signed up via mobile app)
-        metadata = user.user_metadata or {}
-        return {
-            "id": user.id,
-            "user_id": metadata.get("user_id", "MOBILE_USER"),
-            "email": user.email,
-            "user_type": metadata.get("user_type", "volunteer"),
-            "full_name": metadata.get("full_name", ""),
-            "nickname": metadata.get("nickname", ""),
-        }
+    metadata = user.user_metadata or {}
+    user_type = profile_data.get("role") or metadata.get("user_type") or metadata.get("role") or "organizer"
 
-    return result.data[0]
+    return {
+        "id": user.id,
+        "user_id": profile_data.get("id") or metadata.get("user_id") or str(user.id),
+        "email": user.email,
+        "user_type": user_type,
+        "role": user_type,
+        "full_name": profile_data.get("full_name") or metadata.get("full_name", ""),
+        "nickname": profile_data.get("nickname") or metadata.get("nickname", ""),
+        "avatar_url": profile_data.get("avatar_url") or metadata.get("avatar_url", ""),
+        "organization_id": profile_data.get("organization_id"),
+        "staff_permissions": profile_data.get("staff_permissions", []),
+    }
 
 
 async def require_organizer(

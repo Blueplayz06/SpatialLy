@@ -89,3 +89,4 @@ start_project.bat
 *.log
 ATTENDEE_LOG.md
 VOLUNTEER_LOG.md
+.scratch/

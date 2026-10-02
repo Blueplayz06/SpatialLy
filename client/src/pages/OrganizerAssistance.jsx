@@ -1,34 +1,40 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { useAuth } from "../context/AuthContext";
 import { useToast } from "../components/Toast";
 import { api } from "../utils/api";
-import { LuUsers, LuUser, LuClock, LuMapPin, LuCircleCheck } from "react-icons/lu";
+import { 
+  LuUsers, 
+  LuUser, 
+  LuClock, 
+  LuMapPin, 
+  LuCircleCheck, 
+  LuTriangleAlert,
+  LuShieldAlert,
+  LuCheck,
+  LuSend
+} from "react-icons/lu";
 
 export default function OrganizerAssistance() {
-  const { user } = useAuth();
+  const { user: _user } = useAuth();
   const toast = useToast();
   const [events, setEvents] = useState([]);
   const [selectedEventId, setSelectedEventId] = useState("");
   const [requests, setRequests] = useState([]);
   const [loading, setLoading] = useState(true);
 
+  // Resolution modal
+  const [resolvingReq, setResolvingReq] = useState(null);
+  const [resolutionNotes, setResolutionNotes] = useState("");
+  const [resolving, setResolving] = useState(false);
+
   useEffect(() => {
     api.get("/api/events/organizer/mine")
       .then((data) => {
-        setEvents(data.events || []);
-        if (data.events && data.events.length > 0) {
-          const liveEvent = data.events.find(e => e.status === "live");
-          if (liveEvent) {
-            setSelectedEventId(liveEvent.id);
-          } else {
-            const upcomingEvent = data.events.find(e => e.status === "upcoming");
-            if (upcomingEvent) {
-              setSelectedEventId(upcomingEvent.id);
-            } else {
-              const endedEvents = data.events.filter(e => e.status === "ended");
-              setSelectedEventId(endedEvents.length > 0 ? endedEvents[endedEvents.length - 1].id : data.events[0].id);
-            }
-          }
+        const evList = data.events || [];
+        setEvents(evList);
+        if (evList.length > 0) {
+          const liveEvent = evList.find(e => e.status === "live") || evList.find(e => e.status === "upcoming") || evList[0];
+          setSelectedEventId(liveEvent.id);
         } else {
           setLoading(false);
         }
@@ -37,17 +43,55 @@ export default function OrganizerAssistance() {
         toast(err.message, "error");
         setLoading(false);
       });
-  }, []);
+  }, [toast]);
 
-  useEffect(() => {
+  const fetchRequests = useCallback(() => {
     if (!selectedEventId) return;
     setLoading(true);
-    
     api.get(`/api/organizer/assistance/${selectedEventId}`)
       .then((data) => setRequests(data.assistance_requests || []))
       .catch((err) => toast(err.message, "error"))
       .finally(() => setLoading(false));
-  }, [selectedEventId]);
+  }, [selectedEventId, toast]);
+
+  useEffect(() => {
+    fetchRequests();
+  }, [fetchRequests]);
+
+  // Escalate request to urgent operational incident
+  const handleEscalate = async (reqId, reqTitle) => {
+    if (!window.confirm(`Escalate "${reqTitle}" to an Urgent Operational Incident?`)) return;
+    try {
+      await api.post(`/api/organizer/assistance/${reqId}/escalate`, {
+        reason: "Escalated by organizer triage desk",
+      });
+      toast("Assistance request escalated to Urgent Incident!", "success");
+      fetchRequests();
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  };
+
+  // Resolve request
+  const handleResolveSubmit = async (e) => {
+    e.preventDefault();
+    if (!resolvingReq) return;
+    setResolving(true);
+    try {
+      await api.put(`/api/organizer/incidents/${resolvingReq.id}`, {
+        status: "resolved",
+        resolution_notes: resolutionNotes || "Assistance provided to attendee",
+      });
+      toast("Assistance request resolved successfully", "success");
+      setResolvingReq(null);
+      setResolutionNotes("");
+      fetchRequests();
+    } catch (err) {
+      toast(err.message, "error");
+    } finally {
+      setResolving(false);
+    }
+  };
 
   const getStatusBadge = (status) => {
     switch(status) {
@@ -63,11 +107,15 @@ export default function OrganizerAssistance() {
 
   const getPriorityColor = (priority) => {
     switch(priority) {
-      case "urgent": return "var(--error)";
-      case "important": return "var(--warning)";
+      case "urgent":
+      case "critical": return "var(--error)";
+      case "important":
+      case "elevated": return "var(--warning)";
       default: return "var(--info)";
     }
   };
+
+  const pendingCount = requests.filter(r => !["resolved", "closed"].includes(r.status)).length;
 
   return (
     <div className="fade-in">
@@ -75,7 +123,7 @@ export default function OrganizerAssistance() {
         <div>
           <h1>Attendee Assistance Desk</h1>
           <p style={{ color: "var(--text-muted)", marginTop: "4px" }}>
-            Triage help requests, lost & found, and ADA assistance.
+            Triage attendee help requests, ADA assistance, and lost-and-found escalations.
           </p>
         </div>
         <div style={{ display: "flex", gap: "12px" }}>
@@ -84,7 +132,7 @@ export default function OrganizerAssistance() {
               className="form-select" 
               value={selectedEventId} 
               onChange={(e) => setSelectedEventId(e.target.value)}
-              style={{ minWidth: "200px" }}
+              style={{ minWidth: "220px" }}
             >
               {events.map(ev => (
                 <option key={ev.id} value={ev.id}>{ev.name} ({ev.status})</option>
@@ -97,7 +145,9 @@ export default function OrganizerAssistance() {
       <div className="card">
         <div className="card-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <h3 className="card-title">Live Assistance Queue</h3>
-          <span className="badge">{requests.filter(r => !["resolved", "closed"].includes(r.status)).length} Active</span>
+          <span className={`badge ${pendingCount > 0 ? "warning" : "success"}`}>
+            {pendingCount} Active Request(s)
+          </span>
         </div>
         
         {loading ? (
@@ -126,60 +176,126 @@ export default function OrganizerAssistance() {
                 </tr>
               </thead>
               <tbody>
-                {requests.map(req => (
-                  <tr key={req.id}>
-                    <td>
-                      <div style={{ display: "flex", alignItems: "flex-start", gap: "12px" }}>
-                        <div style={{ 
-                          width: "8px", 
-                          height: "8px", 
-                          borderRadius: "50%", 
-                          backgroundColor: getPriorityColor(req.priority),
-                          marginTop: "6px"
-                        }} />
-                        <div>
-                          <div style={{ fontWeight: "600", color: "var(--text-primary)" }}>{req.title}</div>
-                          {req.description && (
-                            <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginTop: "2px", display: "-webkit-box", WebkitLineClamp: 1, WebkitBoxOrient: "vertical", overflow: "hidden" }}>
-                              {req.description}
-                            </div>
+                {requests.map(req => {
+                  const isResolved = ["resolved", "closed"].includes(req.status);
+
+                  return (
+                    <tr key={req.id}>
+                      <td>
+                        <div style={{ display: "flex", alignItems: "flex-start", gap: "12px" }}>
+                          <div style={{ 
+                            width: "10px", 
+                            height: "10px", 
+                            borderRadius: "50%", 
+                            backgroundColor: getPriorityColor(req.priority),
+                            marginTop: "6px"
+                          }} />
+                          <div>
+                            <div style={{ fontWeight: "700", color: "var(--text-primary)" }}>{req.title}</div>
+                            {req.description && (
+                              <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginTop: "2px" }}>
+                                {req.description}
+                              </div>
+                            )}
+                            {req.location_description && (
+                              <div style={{ fontSize: "0.75rem", color: "var(--info)", marginTop: "2px" }}>
+                                Pin: {req.location_description}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </td>
+                      <td>{getStatusBadge(req.status)}</td>
+                      <td>
+                        <div style={{ display: "flex", alignItems: "center", gap: "6px", color: "var(--text-secondary)", fontSize: "0.85rem" }}>
+                          <LuMapPin size={14} color="var(--primary)" />
+                          <strong>{req.zone_name || req.venue_zone_name || "Zone"}</strong>
+                        </div>
+                      </td>
+                      <td>
+                        <div style={{ display: "flex", alignItems: "center", gap: "6px", color: "var(--text-muted)", fontSize: "0.85rem" }}>
+                          <LuClock size={14} />
+                          {req.created_at ? new Date(req.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : "—"}
+                        </div>
+                      </td>
+                      <td>
+                        {req.assigned_to ? (
+                          <div style={{ display: "flex", alignItems: "center", gap: "6px", color: "var(--text-primary)", fontSize: "0.85rem" }}>
+                            <LuUser size={14} />
+                            <strong>{req.assigned_to_name || req.assigned_to.substring(0, 8)}</strong>
+                          </div>
+                        ) : (
+                          <span style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>Unassigned</span>
+                        )}
+                      </td>
+                      <td>
+                        <div style={{ display: "flex", gap: "6px" }}>
+                          {!isResolved && (
+                            <button 
+                              className="btn btn-sm btn-outline"
+                              onClick={() => handleEscalate(req.id, req.title)}
+                              style={{ borderColor: "rgba(239, 68, 68, 0.4)", color: "var(--error)", fontSize: "0.75rem" }}
+                              title="Escalate to Urgent Incident"
+                            >
+                              <LuShieldAlert size={12} /> Escalate
+                            </button>
+                          )}
+                          {!isResolved && (
+                            <button 
+                              className="btn btn-sm btn-primary"
+                              onClick={() => setResolvingReq(req)}
+                              style={{ fontSize: "0.75rem" }}
+                              title="Mark as Resolved"
+                            >
+                              <LuCheck size={12} /> Resolve
+                            </button>
                           )}
                         </div>
-                      </div>
-                    </td>
-                    <td>{getStatusBadge(req.status)}</td>
-                    <td>
-                      <div style={{ display: "flex", alignItems: "center", gap: "6px", color: "var(--text-secondary)", fontSize: "0.85rem" }}>
-                        <LuMapPin size={14} />
-                        {req.venue_zone_name || "Unknown"}
-                      </div>
-                    </td>
-                    <td>
-                      <div style={{ display: "flex", alignItems: "center", gap: "6px", color: "var(--text-secondary)", fontSize: "0.85rem" }}>
-                        <LuClock size={14} />
-                        {new Date(req.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                      </div>
-                    </td>
-                    <td>
-                      {req.assigned_to ? (
-                        <div style={{ display: "flex", alignItems: "center", gap: "6px", color: "var(--text-secondary)", fontSize: "0.85rem" }}>
-                          <LuUser size={14} />
-                          {req.assigned_to.substring(0, 8)}...
-                        </div>
-                      ) : (
-                        <span style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>Unassigned</span>
-                      )}
-                    </td>
-                    <td>
-                      <button className="btn btn-ghost btn-sm">Dispatch</button>
-                    </td>
-                  </tr>
-                ))}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
         )}
       </div>
+
+      {/* RESOLUTION MODAL */}
+      {resolvingReq && (
+        <div className="modal-backdrop fade-in" onClick={() => setResolvingReq(null)}>
+          <div className="modal-content" onClick={e => e.stopPropagation()} style={{ maxWidth: "440px" }}>
+            <div className="modal-header">
+              <h3>Resolve Assistance Request</h3>
+              <button className="btn btn-ghost" onClick={() => setResolvingReq(null)}>&times;</button>
+            </div>
+            <div className="modal-body">
+              <p style={{ fontSize: "0.85rem", color: "var(--text-secondary)", marginBottom: "14px" }}>
+                Resolving request: <strong>{resolvingReq.title}</strong>
+              </p>
+              <form onSubmit={handleResolveSubmit} style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+                <div className="form-group">
+                  <label className="form-label">Resolution Notes</label>
+                  <textarea
+                    className="form-textarea"
+                    placeholder="e.g. Volunteer guided attendee to ADA ramp, wheel chair provided."
+                    value={resolutionNotes}
+                    onChange={e => setResolutionNotes(e.target.value)}
+                    required
+                  />
+                </div>
+                <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px", marginTop: "8px" }}>
+                  <button type="button" className="btn btn-ghost" onClick={() => setResolvingReq(null)}>Cancel</button>
+                  <button type="submit" className="btn btn-primary" disabled={resolving}>
+                    {resolving ? "Resolving..." : "Confirm Resolved"}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </div>
+      )}
+
     </div>
   );
 }

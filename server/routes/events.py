@@ -82,9 +82,9 @@ async def list_volunteer_assigned_events(
         raise HTTPException(status_code=403, detail="Volunteer access required")
 
     assignments = (
-        supabase.table("web_volunteer_assignments")
-        .select("event_id, zone")
-        .eq("volunteer_user_id", current_user["user_id"])
+        supabase.table("volunteer_assignments")
+        .select("event_id")
+        .eq("volunteer_id", current_user["user_id"])
         .execute()
     )
 
@@ -129,7 +129,7 @@ async def get_event(event_id: str, current_user: dict = Depends(get_current_user
     )
 
     volunteer_count = (
-        supabase.table("web_volunteer_assignments")
+        supabase.table("volunteer_assignments")
         .select("id", count="exact")
         .eq("event_id", event_id)
         .execute()
@@ -185,6 +185,8 @@ async def create_event(data: EventCreate, current_user: dict = Depends(require_o
         "end_time": data.end_time,
         "location_address": data.location_address or "",
     }
+    if data.venue_id:
+        new_event["venue_id"] = data.venue_id
 
     result = supabase.table("events").insert(new_event).execute()
 
@@ -215,6 +217,26 @@ async def update_event(
     result = supabase.table("events").update(updates).eq("id", event_id).execute()
 
     return {"message": "Event updated successfully", "event": result.data[0]}
+
+
+@router.put("/{event_id}/status")
+async def update_event_status(
+    event_id: str, data: dict, current_user: dict = Depends(require_organizer)
+):
+    supabase = get_supabase()
+    existing = supabase.table("events").select("id, organizer_id").eq("id", event_id).execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Event not found")
+    if existing.data[0].get("organizer_id") != current_user["user_id"]:
+        raise HTTPException(status_code=403, detail="You can only update your own events")
+
+    new_status = data.get("status")
+    valid_statuses = ["draft", "upcoming", "published", "live", "paused", "ended"]
+    if not new_status or new_status not in valid_statuses:
+        raise HTTPException(status_code=400, detail=f"Invalid status '{new_status}'. Allowed: {valid_statuses}")
+
+    result = supabase.table("events").update({"status": new_status}).eq("id", event_id).execute()
+    return {"message": f"Event status updated to {new_status}", "event": result.data[0]}
 
 
 @router.delete("/{event_id}")
@@ -326,3 +348,18 @@ async def cancel_registration(
     ).eq("user_id", current_user["user_id"]).eq("event_id", event_id).execute()
 
     return {"message": "Registration cancelled successfully"}
+
+
+# ═══════════════════════════════════════════════════════════════
+# VENUES ENDPOINT
+# ═══════════════════════════════════════════════════════════════
+
+venues_router = APIRouter(prefix="/api/venues", tags=["Venues"])
+
+
+@venues_router.get("")
+async def list_venues():
+    supabase = get_supabase()
+    result = supabase.table("venues").select("id, name, address, venue_type, default_capacity").order("name").execute()
+    return {"venues": result.data or []}
+

@@ -63,9 +63,9 @@ async def volunteer_dashboard(current_user: dict = Depends(get_current_user)):
     supabase = get_supabase()
 
     assignments = (
-        supabase.table("web_volunteer_assignments")
-        .select("event_id, zone")
-        .eq("volunteer_user_id", current_user["user_id"])
+        supabase.table("volunteer_assignments")
+        .select("event_id")
+        .eq("volunteer_id", current_user["user_id"])
         .execute()
     )
 
@@ -154,7 +154,7 @@ async def organizer_dashboard(current_user: dict = Depends(require_organizer)):
         total_checkins += checkins.count or 0
 
         vols = (
-            supabase.table("web_volunteer_assignments")
+            supabase.table("volunteer_assignments")
             .select("id", count="exact")
             .eq("event_id", eid)
             .execute()
