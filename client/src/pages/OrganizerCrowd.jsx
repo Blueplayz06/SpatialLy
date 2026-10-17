@@ -3,6 +3,7 @@ import { useAuth } from "../context/AuthContext";
 import { useToast } from "../components/Toast";
 import { api } from "../utils/api";
 import { supabase, isSupabaseConfigured } from "../utils/supabaseClient";
+import CrowdPredictionPanel from "../components/CrowdPredictionPanel";
 import { 
   LuRadar, 
   LuMapPin, 
@@ -216,6 +217,8 @@ export default function OrganizerCrowd() {
               </div>
             </div>
           </div>
+
+          <CrowdPredictionPanel eventId={selectedEventId} />
 
           {/* 5-MINUTE ROLLING SURGE CHART */}
           <div className="card" style={{ marginBottom: "24px", padding: "20px" }}>

@@ -189,3 +189,18 @@ CREATE TABLE IF NOT EXISTS lost_found_reports (
 
 CREATE INDEX IF NOT EXISTS idx_lf_event ON lost_found_reports(event_id);
 ALTER TABLE lost_found_reports DISABLE ROW LEVEL SECURITY;
+
+-- 12. Crowd Zone Snapshots (Overcrowding Prediction History)
+CREATE TABLE IF NOT EXISTS crowd_zone_snapshots (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_id UUID NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+    zone_id UUID REFERENCES event_zones(id) ON DELETE CASCADE,
+    estimated_count INTEGER NOT NULL DEFAULT 0,
+    source TEXT DEFAULT 'auto',
+    notes TEXT,
+    snapshot_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_czs_event_time ON crowd_zone_snapshots(event_id, snapshot_at DESC);
+CREATE INDEX IF NOT EXISTS idx_czs_zone ON crowd_zone_snapshots(zone_id);
+ALTER TABLE crowd_zone_snapshots DISABLE ROW LEVEL SECURITY;

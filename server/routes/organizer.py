@@ -4,7 +4,8 @@ from config import get_supabase
 from middleware.auth import get_current_user, require_organizer
 from pydantic import BaseModel
 from typing import Optional, List, Any, Dict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from services import crowd_prediction
 import csv
 import io
 
@@ -547,6 +548,99 @@ async def get_crowd_data(event_id: str, current_user: dict = Depends(require_org
         "raw_counts": counts.data,
         "zones": zones.data,
     }
+
+
+SNAPSHOT_MIN_INTERVAL_SEC = 60
+PREDICTION_HISTORY_MIN = 30
+SNAPSHOT_RETENTION_HOURS = 24
+
+
+@router.get("/crowd/{event_id}/predictions")
+async def get_crowd_predictions(
+    event_id: str,
+    horizon: int = Query(15, ge=5, le=60),
+    current_user: dict = Depends(require_organizer),
+):
+    """Algorithmic overcrowding forecast (graph-based, no ML). Organizer only."""
+    supabase = get_supabase()
+    verify_event_ownership(supabase, event_id, current_user["user_id"])
+    now = datetime.now(timezone.utc)
+
+    zones = supabase.table("event_zones").select("*").eq("event_id", event_id).execute().data or []
+    counts = supabase.table("volunteer_counts").select("*").eq("event_id", event_id).execute().data or []
+
+    # Live count per zone (sum across scanners, like /crowd/{event_id})
+    current: Dict[str, Any] = {}
+    for z in zones:
+        zc = [c for c in counts if c.get("zone") == z.get("name") or c.get("zone_id") == z.get("id")]
+        if zc:
+            stamps = [crowd_prediction.parse_ts(c.get("updated_at")) for c in zc]
+            stamps = [s for s in stamps if s]
+            current[z["id"]] = (sum(c.get("active_count", 0) or 0 for c in zc), max(stamps) if stamps else now)
+
+    # Recent history
+    since = (now - timedelta(minutes=PREDICTION_HISTORY_MIN)).isoformat()
+    history: Dict[str, list] = {}
+    last_snapshot: Dict[str, Any] = {}
+    try:
+        snaps = (supabase.table("crowd_zone_snapshots").select("zone_id, estimated_count, snapshot_at")
+                 .eq("event_id", event_id).gte("snapshot_at", since).order("snapshot_at").limit(3000).execute().data or [])
+        for s in snaps:
+            ts = crowd_prediction.parse_ts(s.get("snapshot_at"))
+            if ts and s.get("zone_id"):
+                history.setdefault(s["zone_id"], []).append((ts, float(s.get("estimated_count") or 0)))
+                last_snapshot[s["zone_id"]] = ts
+    except Exception:
+        pass
+
+    # Throttled auto-recorder: builds the history the forecast depends on
+    try:
+        rows = []
+        for zid, (count, _) in current.items():
+            last = last_snapshot.get(zid)
+            if not last or (now - last).total_seconds() >= SNAPSHOT_MIN_INTERVAL_SEC:
+                rows.append({"event_id": event_id, "zone_id": zid, "estimated_count": count,
+                             "source": "auto", "snapshot_at": now.isoformat()})
+                history.setdefault(zid, []).append((now, float(count)))
+        if rows:
+            supabase.table("crowd_zone_snapshots").insert(rows).execute()
+            # Prune stale snapshots older than 24h
+            cutoff = (now - timedelta(hours=SNAPSHOT_RETENTION_HOURS)).isoformat()
+            supabase.table("crowd_zone_snapshots").delete().eq("event_id", event_id).lt("snapshot_at", cutoff).execute()
+    except Exception:
+        pass
+
+    # Scheduled surges (sessions ending or starting within the horizon)
+    sessions: list = []
+    try:
+        sessions = (supabase.table("sessions").select("zone_id, title, start_time, end_time")
+                    .eq("event_id", event_id).gte("end_time", now.isoformat())
+                    .lte("start_time", (now + timedelta(minutes=horizon)).isoformat()).execute().data or [])
+    except Exception:
+        pass
+
+    # Gate check-in rate (last 10 min) mapped to zones by id or name
+    arrivals: Dict[str, float] = {}
+    try:
+        tk = (supabase.table("tickets").select("checked_in_zone, check_in_at").eq("event_id", event_id)
+              .gte("check_in_at", (now - timedelta(minutes=10)).isoformat()).execute().data or [])
+        key = {}
+        for z in zones:
+            key[z["id"]] = z["id"]
+            key[z.get("name")] = z["id"]
+        for t in tk:
+            zid = key.get(t.get("checked_in_zone"))
+            if zid:
+                arrivals[zid] = arrivals.get(zid, 0.0) + 0.1
+    except Exception:
+        pass
+
+    predictions = crowd_prediction.predict(
+        zones, history, current, sessions=sessions, arrivals_per_min=arrivals,
+        horizon_min=horizon, now=now,
+    )
+    return {"event_id": event_id, "horizon_minutes": horizon, "computed_at": now.isoformat(),
+            "predictions": predictions}
 
 
 # ═══════════════════════════════════════════════════════════════
