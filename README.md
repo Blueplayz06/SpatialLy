@@ -42,6 +42,25 @@ Detailed architectural, database, and operational system guides for Organizer We
 
 ## Quick Start
 
+### 0. Quick Start on Windows (One-Click Launcher)
+Double-click `start.bat` or run:
+```bat
+start.bat
+```
+This interactive launcher checks prerequisites (Node.js, Python `.venv`, `.env` configuration) and opens:
+- **Organizer Web Frontend** at `http://localhost:5173`
+- **FastAPI Backend Service** at `http://localhost:8000` (Swagger docs at `/docs`)
+
+You can also pass direct flags:
+```bat
+start.bat web        # Launches both Frontend and Backend
+start.bat client     # Frontend only
+start.bat server     # Backend API only
+start.bat sim        # Run crowd simulation harness
+start.bat stop       # Kill running dev servers on ports 8000 and 5173
+```
+To stop all active services anytime, double-click `stop.bat` or run `start.bat stop`.
+
 ### 1. Mobile Apps (Flutter)
 ```bash
 # Attendee App

@@ -86,6 +86,8 @@ hs_err_pid*.log
 # ============================================================
 start_project.bat
 *.bat
+!start.bat
+!stop.bat
 *.log
 ATTENDEE_LOG.md
 VOLUNTEER_LOG.md

@@ -189,8 +189,29 @@ async def create_event(data: EventCreate, current_user: dict = Depends(require_o
         new_event["venue_id"] = data.venue_id
 
     result = supabase.table("events").insert(new_event).execute()
+    created_event = result.data[0]
 
-    return {"message": "Event created successfully", "event": result.data[0]}
+    # Automatically create initial event_zones if zones are provided
+    if data.zones:
+        zone_records = []
+        for idx, z in enumerate(data.zones):
+            z_name = z.strip() if isinstance(z, str) else str(z).strip()
+            if not z_name:
+                continue
+            zone_records.append({
+                "event_id": created_event["id"],
+                "name": z_name,
+                "code": z_name.upper().replace(" ", "_")[:20],
+                "floor_level": 1,
+                "is_crowd_monitored": True,
+            })
+        if zone_records:
+            try:
+                supabase.table("event_zones").insert(zone_records).execute()
+            except Exception as e:
+                print(f"[WARN] Failed to insert initial event_zones: {e}")
+
+    return {"message": "Event created successfully", "event": created_event}
 
 
 @router.put("/{event_id}")
@@ -360,6 +381,12 @@ venues_router = APIRouter(prefix="/api/venues", tags=["Venues"])
 @venues_router.get("")
 async def list_venues():
     supabase = get_supabase()
-    result = supabase.table("venues").select("id, name, address, venue_type, default_capacity").order("name").execute()
-    return {"venues": result.data or []}
+    result = supabase.table("venues").select("*").order("name").execute()
+    venues = []
+    for v in (result.data or []):
+        meta = v.get("metadata") or {}
+        v_dict = dict(v)
+        v_dict["default_capacity"] = meta.get("default_capacity", None)
+        venues.append(v_dict)
+    return {"venues": venues}
 

@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+import uuid
 from typing import Optional, List, Dict, Any
 from config import get_supabase
 from middleware.auth import get_current_user, require_organizer, require_volunteer
@@ -13,8 +14,14 @@ router = APIRouter(prefix="/api/venue-map", tags=["Venue Map"])
 # ═══════════════════════════════════════════════════════════════
 
 class ZoneBoundsUpdate(BaseModel):
-    zone_id: str
-    bounds: Dict[str, float]  # {left, top, width, height}
+    zone_id: Optional[str] = None
+    zone: Optional[str] = None
+    name: Optional[str] = None
+    code: Optional[str] = None
+    bounds: Optional[Dict[str, Any]] = None
+    polygon: Optional[List[Any]] = None
+    x: Optional[float] = None
+    y: Optional[float] = None
 
 
 class ZoneLayoutBoundsRequest(BaseModel):
@@ -170,10 +177,52 @@ async def save_zone_layout(
     if not event.data or event.data[0].get("organizer_id") != current_user["user_id"]:
         raise HTTPException(status_code=403, detail="Not authorized to edit zones for this event")
 
-    for item in data.layout:
-        supabase.table("event_zones").update({
-            "bounds": item.bounds,
-        }).eq("id", item.zone_id).eq("event_id", event_id).execute()
+    # Fetch existing event_zones to match by UUID or name
+    existing_res = supabase.table("event_zones").select("id, name, code").eq("event_id", event_id).execute()
+    existing_zones = existing_res.data or []
+    zones_by_id = {z["id"]: z for z in existing_zones}
+    zones_by_name = {z["name"].strip().lower(): z for z in existing_zones if z.get("name")}
+
+    for idx, item in enumerate(data.layout):
+        bounds = item.bounds or {}
+        zone_id = item.zone_id
+        zone_name = (item.zone or item.name or "").strip()
+
+        # Check if zone_id is a valid UUID and exists
+        target_id = None
+        if zone_id:
+            try:
+                parsed_uuid = str(uuid.UUID(str(zone_id)))
+                if parsed_uuid in zones_by_id:
+                    target_id = parsed_uuid
+            except (ValueError, TypeError, AttributeError):
+                target_id = None
+
+        # Fallback: match by zone name
+        if not target_id and zone_name and zone_name.lower() in zones_by_name:
+            target_id = zones_by_name[zone_name.lower()]["id"]
+
+        update_payload = {"bounds": bounds}
+        if item.polygon:
+            update_payload["polygon"] = item.polygon
+
+        if target_id:
+            supabase.table("event_zones").update(update_payload).eq("id", target_id).eq("event_id", event_id).execute()
+        else:
+            # If no zone exists yet (e.g. created during initial event setup), insert it
+            name_to_use = zone_name or f"Zone {idx + 1}"
+            new_zone = {
+                "event_id": event_id,
+                "name": name_to_use,
+                "code": (item.code or name_to_use).upper().replace(" ", "_")[:20],
+                "floor_level": 1,
+                "bounds": bounds,
+                "is_crowd_monitored": True,
+            }
+            inserted = supabase.table("event_zones").insert(new_zone).execute()
+            if inserted.data:
+                zones_by_name[name_to_use.lower()] = inserted.data[0]
+                zones_by_id[inserted.data[0]["id"]] = inserted.data[0]
 
     return {"message": "Layout saved successfully"}
 
