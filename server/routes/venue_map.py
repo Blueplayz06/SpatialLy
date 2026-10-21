@@ -101,6 +101,19 @@ async def get_zone_density(event_id: str, current_user: dict = Depends(get_curre
 # LAYOUT (from DB — no flat file)
 # ═══════════════════════════════════════════════════════════════
 
+import math
+
+# Auto-layout spatial presets for balanced canvas distribution
+ZONE_SPATIAL_PRESETS = [
+    {"bounds": {"left": 0.35, "top": 0.08, "width": 0.30, "height": 0.22}, "entrance": {"x": 0.50, "y": 0.19}},
+    {"bounds": {"left": 0.07, "top": 0.36, "width": 0.26, "height": 0.25}, "entrance": {"x": 0.20, "y": 0.48}},
+    {"bounds": {"left": 0.38, "top": 0.38, "width": 0.24, "height": 0.22}, "entrance": {"x": 0.50, "y": 0.49}},
+    {"bounds": {"left": 0.67, "top": 0.36, "width": 0.26, "height": 0.25}, "entrance": {"x": 0.80, "y": 0.48}},
+    {"bounds": {"left": 0.35, "top": 0.68, "width": 0.30, "height": 0.20}, "entrance": {"x": 0.50, "y": 0.78}},
+    {"bounds": {"left": 0.08, "top": 0.68, "width": 0.24, "height": 0.20}, "entrance": {"x": 0.20, "y": 0.78}},
+    {"bounds": {"left": 0.68, "top": 0.68, "width": 0.24, "height": 0.20}, "entrance": {"x": 0.80, "y": 0.78}},
+]
+
 @router.get("/{event_id}/layout")
 async def get_zone_layout(
     event_id: str,
@@ -126,31 +139,41 @@ async def get_zone_layout(
         query = query.eq("level_id", level_id)
 
     result = query.execute()
+    data = result.data or []
+
+    # Detect if zones are unpositioned or all stacked at (0, 0)
+    all_zero_bounds = len(data) > 1 and all(
+        (z.get("bounds") or {}).get("left", 0) == (data[0].get("bounds") or {}).get("left", 0) and
+        (z.get("bounds") or {}).get("top", 0) == (data[0].get("bounds") or {}).get("top", 0)
+        for z in data
+    )
 
     # Normalize into a layout array for the frontend
     layout = []
-    for z in result.data:
+    for idx, z in enumerate(data):
         venue_zone = z.get("venue_zone") or {}
-        # Prefer venue_zone polygon, fall back to bounds-derived rect
         polygon = venue_zone.get("polygon")
-        bounds = z.get("bounds") or venue_zone.get("bounds") or {
-            "left": 0.1, "top": 0.1, "width": 0.2, "height": 0.2
-        }
-        entrance = z.get("entrance_point") or venue_zone.get("entrance_point") or {
-            "x": bounds.get("left", 0.1) + bounds.get("width", 0.2) / 2,
-            "y": bounds.get("top", 0.1) + bounds.get("height", 0.2) / 2,
-        }
+
+        if all_zero_bounds:
+            preset = ZONE_SPATIAL_PRESETS[idx % len(ZONE_SPATIAL_PRESETS)]
+            bounds = preset["bounds"]
+            entrance = preset["entrance"]
+        else:
+            bounds = z.get("bounds") or venue_zone.get("bounds") or ZONE_SPATIAL_PRESETS[idx % len(ZONE_SPATIAL_PRESETS)]["bounds"]
+            entrance = z.get("entrance_point") or venue_zone.get("entrance_point") or {
+                "x": bounds.get("left", 0.1) + bounds.get("width", 0.2) / 2,
+                "y": bounds.get("top", 0.1) + bounds.get("height", 0.2) / 2,
+            }
 
         layout.append({
             "zone_id": z["id"],
             "zone": z["name"],
-            "code": z["code"],
+            "code": z.get("code") or f"Z{idx+1}",
             "level_id": z.get("level_id"),
             "venue_zone_id": z.get("venue_zone_id"),
             "polygon": polygon,
             "bounds": bounds,
             "entrance_point": entrance,
-            # centroid x/y for backward compat with frontend pin placement
             "x": entrance["x"],
             "y": entrance["y"],
             "capacity_limit": z.get("capacity_limit"),
@@ -262,13 +285,13 @@ async def get_event_levels(event_id: str, current_user: dict = Depends(get_curre
 
 @router.get("/{event_id}/volunteers")
 async def get_volunteer_positions(event_id: str, current_user: dict = Depends(get_current_user)):
-    """Get all active volunteer positions for this event from volunteer_shifts."""
+    """Get all active volunteer positions with live crowd counts and dynamic node colors."""
     supabase = get_supabase()
 
-    # Get active/scheduled shifts for this event
+    # 1. Get active/scheduled shifts for this event
     shifts = (
         supabase.table("volunteer_shifts")
-        .select("id, volunteer_id, zone_id, zone_name, status, break_state, scheduled_start, scheduled_end")
+        .select("id, volunteer_id, zone_id, zone_name, status, break_state, scheduled_start, scheduled_end, team_id")
         .eq("event_id", event_id)
         .in_("status", ["scheduled", "active", "on_break"])
         .execute()
@@ -277,7 +300,7 @@ async def get_volunteer_positions(event_id: str, current_user: dict = Depends(ge
     if not shifts.data:
         return {"positions": []}
 
-    # Enrich with volunteer profile names
+    # 2. Volunteer profile names
     vol_ids = list(set(s["volunteer_id"] for s in shifts.data if s.get("volunteer_id")))
     vol_map = {}
     if vol_ids:
@@ -287,43 +310,127 @@ async def get_volunteer_positions(event_id: str, current_user: dict = Depends(ge
             .in_("id", vol_ids)
             .execute()
         )
-        vol_map = {p["id"]: p for p in profiles.data}
+        vol_map = {p["id"]: p for p in (profiles.data or [])}
 
-    # Get zone centroids for pin placement
-    zone_ids = list(set(s["zone_id"] for s in shifts.data if s.get("zone_id")))
-    zone_map = {}
-    if zone_ids:
-        zones = (
-            supabase.table("event_zones")
-            .select("id, name, bounds, entrance_point")
-            .in_("id", zone_ids)
-            .execute()
-        )
-        for z in zones.data:
-            ep = z.get("entrance_point") or {}
-            b = z.get("bounds") or {}
-            zone_map[z["id"]] = {
-                "name": z["name"],
-                "x": ep.get("x", b.get("left", 0.1) + b.get("width", 0.2) / 2) * 100,
-                "y": ep.get("y", b.get("top", 0.1) + b.get("height", 0.2) / 2) * 100,
-            }
+    # 3. Live volunteer proximity counts from volunteer_counts
+    counts_res = supabase.table("volunteer_counts").select("*").eq("event_id", event_id).execute()
+    counts_data = counts_res.data or []
+    vol_counts = {c["volunteer_id"]: c.get("active_count", 0) for c in counts_data if c.get("volunteer_id")}
+    zone_counts = {}
+    for c in counts_data:
+        z = c.get("zone")
+        if z:
+            zone_counts[z] = zone_counts.get(z, 0) + c.get("active_count", 0)
 
+    # 4. Active urgent incidents
+    incidents_res = supabase.table("operational_incidents").select("zone_id, venue_zone_name, priority, status").eq("event_id", event_id).execute()
+    active_incidents = [i for i in (incidents_res.data or []) if i.get("status") not in ("resolved", "closed")]
+    urgent_zone_ids = {i.get("zone_id") for i in active_incidents if i.get("priority") in ("urgent", "critical")}
+    urgent_zone_names = {i.get("venue_zone_name") for i in active_incidents if i.get("priority") in ("urgent", "critical")}
+
+    # 5. Event zones coordinates and capacities
+    all_zones_res = supabase.table("event_zones").select("id, name, bounds, entrance_point, operating_capacity, capacity_limit").eq("event_id", event_id).execute()
+    all_zones = all_zones_res.data or []
+    zone_meta = {}
+
+    all_zero_bounds = len(all_zones) > 1 and all(
+        (z.get("bounds") or {}).get("left", 0) == (all_zones[0].get("bounds") or {}).get("left", 0) and
+        (z.get("bounds") or {}).get("top", 0) == (all_zones[0].get("bounds") or {}).get("top", 0)
+        for z in all_zones
+    )
+
+    for idx, z in enumerate(all_zones):
+        if all_zero_bounds:
+            preset = ZONE_SPATIAL_PRESETS[idx % len(ZONE_SPATIAL_PRESETS)]
+            ep = preset["entrance"]
+        else:
+            ep = z.get("entrance_point") or (z.get("bounds") and {
+                "x": z["bounds"].get("left", 0.1) + z["bounds"].get("width", 0.2) / 2,
+                "y": z["bounds"].get("top", 0.1) + z["bounds"].get("height", 0.2) / 2
+            }) or ZONE_SPATIAL_PRESETS[idx % len(ZONE_SPATIAL_PRESETS)]["entrance"]
+
+        zone_meta[z["id"]] = {
+            "name": z["name"],
+            "x": ep["x"] * 100,
+            "y": ep["y"] * 100,
+            "capacity": z.get("operating_capacity") or z.get("capacity_limit") or 100
+        }
+        zone_meta[z["name"]] = zone_meta[z["id"]]
+
+    # Count volunteers per zone to calculate clean non-overlapping offsets
+    zone_vol_counts = {}
+    for shift in shifts.data:
+        key = shift.get("zone_id") or shift.get("zone_name")
+        zone_vol_counts[key] = zone_vol_counts.get(key, 0) + 1
+
+    zone_vol_idx = {}
     enriched = []
     for shift in shifts.data:
-        vol_profile = vol_map.get(shift["volunteer_id"], {})
-        zone_info = zone_map.get(shift["zone_id"], {})
+        vol_id = shift.get("volunteer_id")
+        vol_profile = vol_map.get(vol_id, {})
+        zid = shift.get("zone_id")
+        zname = shift.get("zone_name")
+        zinfo = zone_meta.get(zid) or zone_meta.get(zname) or {"name": zname or "Zone", "x": 50.0, "y": 50.0, "capacity": 100}
+
+        # Multi-volunteer offset in same zone
+        key = zid or zname
+        total_in_zone = zone_vol_counts.get(key, 1)
+        curr_idx = zone_vol_idx.get(key, 0)
+        zone_vol_idx[key] = curr_idx + 1
+
+        base_x = zinfo["x"]
+        base_y = zinfo["y"]
+        if total_in_zone > 1:
+            angle = (2 * math.pi * curr_idx) / total_in_zone
+            offset_r = 5.2
+            posX = base_x + (offset_r * math.cos(angle))
+            posY = base_y + (offset_r * math.sin(angle))
+        else:
+            posX = base_x
+            posY = base_y
+
+        # Proximity crowd count near volunteer
+        nearby_count = vol_counts.get(vol_id)
+        if nearby_count is None:
+            nearby_count = zone_counts.get(zname, 35)
+
+        cap = zinfo.get("capacity", 100)
+        zone_total = zone_counts.get(zname, nearby_count)
+        crowd_ratio = max(nearby_count / max(cap, 1), zone_total / max(cap, 1))
+        has_urgent_incident = (zid in urgent_zone_ids) or (zname in urgent_zone_names)
+
+        is_overcrowded = (crowd_ratio >= 0.85) or has_urgent_incident
+
+        if is_overcrowded:
+            status_color = "#EF4444"  # Critical red
+            status_label = "critical"
+        elif crowd_ratio >= 0.65:
+            status_color = "#F59E0B"  # Elevated amber
+            status_label = "elevated"
+        elif crowd_ratio >= 0.40:
+            status_color = "#3B82F6"  # Moderate blue
+            status_label = "moderate"
+        else:
+            status_color = "#10B981"  # Optimal green
+            status_label = "normal"
 
         enriched.append({
-            "volunteer_user_id": shift["volunteer_id"],
-            "volunteer_name": vol_profile.get("full_name", "Unknown"),
+            "volunteer_user_id": vol_id,
+            "volunteer_name": vol_profile.get("full_name", "Staff Member"),
             "avatar_url": vol_profile.get("avatar_url"),
-            "zone": shift.get("zone_name") or zone_info.get("name", "Unknown"),
-            "zone_id": shift.get("zone_id"),
-            "pos_x": zone_info.get("x", 50.0),
-            "pos_y": zone_info.get("y", 50.0),
+            "zone": zname or zinfo.get("name", "Unknown"),
+            "zone_id": zid,
+            "pos_x": round(posX, 2),
+            "pos_y": round(posY, 2),
             "status": shift.get("status"),
             "break_state": shift.get("break_state"),
             "shift_id": shift["id"],
+            "active_count": nearby_count,
+            "operating_capacity": cap,
+            "crowd_ratio": round(crowd_ratio, 2),
+            "is_overcrowded": is_overcrowded,
+            "node_color": status_color,
+            "status_label": status_label,
         })
 
     return {"positions": enriched}

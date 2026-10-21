@@ -44,15 +44,162 @@ STANDARD_TEAMS = [
 ]
 
 
-def resolve_or_create_event(supabase, target_event_id: Optional[str] = None) -> Dict[str, Any]:
-    """Finds an existing event or creates a high-fidelity Demo Showcase Event."""
+def resolve_or_create_organizer(supabase, organizer_query: str) -> Dict[str, Any]:
+    """
+    Finds existing organizer profile by name or email, promotes if necessary,
+    or registers a new demo organizer profile.
+    """
+    query = organizer_query.strip()
+    try:
+        by_email = supabase.table("profiles").select("*").ilike("email", f"%{query}%").execute().data or []
+    except Exception:
+        by_email = []
+    try:
+        by_name = supabase.table("profiles").select("*").ilike("full_name", f"%{query}%").execute().data or []
+    except Exception:
+        by_name = []
+
+    candidates_map = {p["id"]: p for p in (by_email + by_name)}
+    candidates = list(candidates_map.values())
+
+    if candidates:
+        # Prioritize organizer or admin roles
+        organizer = next((p for p in candidates if p.get("role") in ("organizer", "admin")), None)
+        if not organizer:
+            organizer = candidates[0]
+            # Ensure the user has organizer access to the dashboard
+            try:
+                supabase.table("profiles").update({"role": "organizer"}).eq("id", organizer["id"]).execute()
+                organizer["role"] = "organizer"
+                print(f"[*] Promoted '{organizer.get('full_name')}' to 'organizer' role for dashboard access.")
+            except Exception as e:
+                print(f"    Notice updating role: {e}")
+        return organizer
+
+    # If profile does not exist, create a dedicated demo organizer
+    slug = query.lower().replace(" ", ".")
+    demo_email = f"{slug}@spatially.demo"
+    print(f"[*] Registering new organizer profile for '{query}' ({demo_email})...")
+
+    uid = None
+    try:
+        auth_res = supabase.auth.admin.create_user({
+            "email": demo_email,
+            "password": "Password123!",
+            "email_confirm": True,
+            "user_metadata": {"full_name": query, "role": "organizer"}
+        })
+        uid = auth_res.user.id
+    except Exception:
+        uid = str(uuid.uuid4())
+
+    new_profile = {
+        "id": uid,
+        "email": demo_email,
+        "full_name": query,
+        "role": "organizer"
+    }
+    try:
+        supabase.table("profiles").upsert(new_profile).execute()
+    except Exception as e:
+        print(f"    Profile creation notice: {e}")
+
+    return new_profile
+
+
+def resolve_or_create_event(
+    supabase,
+    target_event_id: Optional[str] = None,
+    target_event_name: Optional[str] = None,
+    target_organizer_query: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Finds an existing event or creates a high-fidelity Demo Showcase Event.
+    If organizer name is passed, creates/binds a dedicated live event for that organizer.
+    """
+    now = datetime.now(timezone.utc)
+
+    # 1. Targeted Organizer passed: Create or bind a dedicated showcase event for this organizer
+    if target_organizer_query:
+        organizer = resolve_or_create_organizer(supabase, target_organizer_query)
+        org_id = organizer["id"]
+        org_name = organizer.get("full_name") or organizer.get("email")
+        print(f"[OK] Bound to Organizer: {org_name} (Role: {organizer.get('role')}, ID: {org_id})")
+
+        event_title = target_event_name.strip() if target_event_name else f"{org_name}'s Live Innovation Showcase 2026"
+
+        # Check if an event with this title already exists for this organizer
+        try:
+            existing = supabase.table("events").select("*").eq("organizer_id", org_id).ilike("name", f"%{event_title}%").execute()
+            if existing.data:
+                print(f"[OK] Found existing event '{existing.data[0]['name']}' under organizer {org_name}.")
+                return existing.data[0]
+        except Exception:
+            pass
+
+        # Generate fresh event under this organizer
+        print(f"[*] Generating new Live Demo Event '{event_title}' for organizer '{org_name}'...")
+        new_event = {
+            "name": event_title,
+            "status": "live",
+            "event_date": now.isoformat(),
+            "start_time": (now - timedelta(hours=1)).strftime("%H:%M"),
+            "end_time": (now + timedelta(hours=8)).strftime("%H:%M"),
+            "venue": "Convention Grand Arena",
+            "location_address": "Tech District, Pavilion 1-4",
+            "organizer_id": org_id,
+            "organizer_name": org_name,
+            "capacity": 800,
+            "description": f"Official live demonstration showcase for judges review. Managed by {org_name}."
+        }
+        try:
+            created = supabase.table("events").insert(new_event).execute()
+            if created.data:
+                print(f"[OK] Created live event '{event_title}' (UUID: {created.data[0]['id']})")
+                return created.data[0]
+        except Exception as e:
+            print(f"    Event creation error: {e}")
+
+    # 2. Specific Event UUID provided
     if target_event_id:
         res = supabase.table("events").select("*").eq("id", target_event_id).execute()
         if res.data:
             return res.data[0]
-        print(f"[!] Specified event {target_event_id} not found. Searching active events...")
+        print(f"[!] Specified event UUID {target_event_id} not found. Searching alternative...")
 
-    # Look for live or upcoming events with existing zones
+    # 3. Specific Event Name provided
+    if target_event_name:
+        try:
+            res = supabase.table("events").select("*").ilike("name", f"%{target_event_name.strip()}%").execute()
+            if res.data:
+                print(f"[OK] Matched existing event by name: '{res.data[0]['name']}' ({res.data[0]['id']})")
+                return res.data[0]
+        except Exception:
+            pass
+
+        print(f"[*] Event '{target_event_name}' not found. Creating fresh event...")
+        default_org = supabase.table("profiles").select("id, full_name").in_("role", ["admin", "organizer"]).limit(1).execute().data
+        org_id = default_org[0]["id"] if default_org else None
+        org_name = default_org[0]["full_name"] if default_org else "Event Organizer"
+
+        new_event = {
+            "name": target_event_name.strip(),
+            "status": "live",
+            "event_date": now.isoformat(),
+            "start_time": (now - timedelta(hours=1)).strftime("%H:%M"),
+            "end_time": (now + timedelta(hours=8)).strftime("%H:%M"),
+            "venue": "Convention Grand Arena",
+            "location_address": "Convention Center, Hall 1",
+            "organizer_id": org_id,
+            "organizer_name": org_name,
+            "capacity": 800,
+            "description": f"Live demonstration showcase: {target_event_name.strip()}."
+        }
+        created = supabase.table("events").insert(new_event).execute()
+        if created.data:
+            return created.data[0]
+
+    # 4. Auto-detect first live or upcoming event with existing zones
     events_res = supabase.table("events").select("*").order("created_at", desc=True).limit(10).execute()
     for ev in (events_res.data or []):
         zones_check = supabase.table("event_zones").select("id").eq("event_id", ev["id"]).execute()
@@ -62,43 +209,105 @@ def resolve_or_create_event(supabase, target_event_id: Optional[str] = None) -> 
     if events_res.data:
         return events_res.data[0]
 
-    # Create fresh demo event if none exists
+    # 5. Fallback demo event
     print("[*] Creating dedicated 'National Tech Summit 2026 - Live Showcase' event...")
-    now = datetime.now(timezone.utc)
     new_event = {
         "name": "National Tech Summit 2026 - Live Showcase",
         "status": "live",
         "event_date": now.isoformat(),
         "start_time": (now - timedelta(hours=1)).strftime("%H:%M"),
         "end_time": (now + timedelta(hours=8)).strftime("%H:%M"),
-        "location": "Convention Center - Grand Hall",
+        "venue": "Convention Grand Arena",
+        "location_address": "Convention Center - Grand Hall",
         "description": "Live production demonstration environment for Spatially judges review."
     }
     created = supabase.table("events").insert(new_event).execute()
     return created.data[0]
 
 
+def ensure_event_tickets(supabase, event_id: str, count: int = 100):
+    """Ensures realistic registered and checked-in attendee tickets exist."""
+    try:
+        existing = supabase.table("tickets").select("id", count="exact").eq("event_id", event_id).execute()
+        if existing.count and existing.count > 10:
+            return
+
+        # Fetch valid profile IDs to satisfy attendee_id constraint
+        profiles_res = supabase.table("profiles").select("id").execute()
+        valid_ids = [p["id"] for p in (profiles_res.data or [])]
+        if not valid_ids:
+            return
+
+        now = datetime.now(timezone.utc)
+        tickets = []
+        checked_in_target = int(count * 0.76)  # 76% checked in
+        for i in range(count):
+            is_checked = (i < checked_in_target)
+            att_id = valid_ids[i % len(valid_ids)]
+            tickets.append({
+                "event_id": event_id,
+                "attendee_id": att_id,
+                "ticket_code": str(uuid.uuid4()),
+                "status": "checked_in" if is_checked else "purchased",
+                "purchased_at": (now - timedelta(days=2)).isoformat(),
+                "checked_in_at": (now - timedelta(minutes=random.randint(10, 180))).isoformat() if is_checked else None
+            })
+        supabase.table("tickets").insert(tickets).execute()
+        print(f"[OK] Seeded {count} attendee tickets ({checked_in_target} checked in) for dashboard metrics.")
+    except Exception as e:
+        print(f"    Tickets notice: {e}")
+
+
 def ensure_event_zones(supabase, event_id: str) -> List[Dict[str, Any]]:
-    """Ensures the event has realistic operational zones with capacities."""
+    """Ensures the event has realistic operational zones with calibrated spatial bounds and capacities."""
     zones_res = supabase.table("event_zones").select("*").eq("event_id", event_id).execute()
     zones = zones_res.data or []
+
+    calibrated_presets = [
+        {"name": "Main Stage", "code": "701", "capacity_limit": 200, "operating_capacity": 180, "bounds": {"left": 0.35, "top": 0.08, "width": 0.30, "height": 0.22}, "entrance_point": {"x": 0.50, "y": 0.19}},
+        {"name": "Exhibition Hall A", "code": "702", "capacity_limit": 150, "operating_capacity": 130, "bounds": {"left": 0.07, "top": 0.36, "width": 0.26, "height": 0.25}, "entrance_point": {"x": 0.20, "y": 0.48}},
+        {"name": "Food & Networking Plaza", "code": "705", "capacity_limit": 140, "operating_capacity": 110, "bounds": {"left": 0.38, "top": 0.38, "width": 0.24, "height": 0.22}, "entrance_point": {"x": 0.50, "y": 0.49}},
+        {"name": "Exhibition Hall B", "code": "703", "capacity_limit": 120, "operating_capacity": 100, "bounds": {"left": 0.67, "top": 0.36, "width": 0.26, "height": 0.25}, "entrance_point": {"x": 0.80, "y": 0.48}},
+        {"name": "Registration Entrance", "code": "704", "capacity_limit": 100, "operating_capacity": 80, "bounds": {"left": 0.35, "top": 0.68, "width": 0.30, "height": 0.20}, "entrance_point": {"x": 0.50, "y": 0.78}},
+    ]
+
+    # If zones already exist, verify and update any zero or missing bounds
     if len(zones) >= 3:
+        needs_bounds_update = any(
+            not z.get("bounds") or 
+            (z.get("bounds", {}).get("left", 0) == 0 and z.get("bounds", {}).get("top", 0) == 0)
+            for z in zones
+        )
+        if needs_bounds_update:
+            print("[*] Upgrading existing zone spatial layouts with calibrated stage coordinates...")
+            for idx, z in enumerate(zones):
+                preset = calibrated_presets[idx % len(calibrated_presets)]
+                supabase.table("event_zones").update({
+                    "bounds": preset["bounds"],
+                    "entrance_point": preset["entrance_point"],
+                    "operating_capacity": z.get("operating_capacity") or preset["operating_capacity"],
+                    "capacity_limit": z.get("capacity_limit") or preset["capacity_limit"],
+                }).eq("id", z["id"]).execute()
+            # Reload updated zones
+            zones = supabase.table("event_zones").select("*").eq("event_id", event_id).execute().data or []
         return zones
 
     print(f"[*] Provisioning operational demo zones for event {event_id}...")
-    default_zones = [
-        {"name": "Main Stage", "capacity_limit": 200, "operating_capacity": 180, "is_crowd_monitored": True},
-        {"name": "Exhibition Hall A", "capacity_limit": 150, "operating_capacity": 130, "is_crowd_monitored": True},
-        {"name": "Exhibition Hall B", "capacity_limit": 120, "operating_capacity": 100, "is_crowd_monitored": True},
-        {"name": "Registration Entrance", "capacity_limit": 100, "operating_capacity": 80, "is_crowd_monitored": True},
-        {"name": "Food & Networking Plaza", "capacity_limit": 140, "operating_capacity": 110, "is_crowd_monitored": True},
-    ]
-
     inserted = []
-    for dz in default_zones:
-        dz["event_id"] = event_id
+    for dz in calibrated_presets:
+        payload = {
+            "event_id": event_id,
+            "name": dz["name"],
+            "code": dz["code"],
+            "capacity_limit": dz["capacity_limit"],
+            "operating_capacity": dz["operating_capacity"],
+            "bounds": dz["bounds"],
+            "entrance_point": dz["entrance_point"],
+            "is_crowd_monitored": True,
+            "floor_level": 1
+        }
         try:
-            r = supabase.table("event_zones").insert(dz).execute()
+            r = supabase.table("event_zones").insert(payload).execute()
             if r.data:
                 inserted.extend(r.data)
         except Exception as e:
@@ -326,8 +535,8 @@ def update_volunteer_proximity_telemetry(
 
         zone_counts[zname] = count
 
-        # Find volunteers assigned to this zone
-        assigned_vols = [s for s in active_shifts if s.get("zone_id") == zid and s.get("status") == "active"]
+        # Find volunteers assigned to this zone (include active, scheduled, on_break)
+        assigned_vols = [s for s in active_shifts if (s.get("zone_id") == zid or s.get("zone_name") == zname)]
 
         # Update volunteer_counts table (keyed on volunteer_id per active scanner)
         for vol_shift in assigned_vols:
@@ -335,7 +544,11 @@ def update_volunteer_proximity_telemetry(
             if vol_id:
                 try:
                     # Scanner count near this specific volunteer
-                    vol_cnt = count // max(len(assigned_vols), 1)
+                    if is_overcrowded:
+                        vol_cnt = max(int(cap * 0.95) + random.randint(-2, 3), int(cap * 0.90))
+                    else:
+                        vol_cnt = max(int(cap * 0.35) + random.randint(-3, 3), 18)
+
                     supabase.table("volunteer_counts").upsert({
                         "volunteer_id": vol_id,
                         "event_id": event_id,
@@ -517,18 +730,22 @@ def resolve_overcrowding_scenario(
         print(f"    Task completion warning: {e}")
 
 
-def print_banner(event_name: str, event_id: str):
+def print_banner(event_name: str, event_id: str, organizer_name: Optional[str] = None):
     print("\n" + "=" * 68)
     print("        SPATIALLY VOLUNTEER & REAL-TIME DEMO HARNESS")
     print("=" * 68)
     print(f"  Target Event : {event_name}")
     print(f"  Event UUID   : {event_id}")
+    if organizer_name:
+        print(f"  Organizer    : {organizer_name}")
     print("=" * 68)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Simulate volunteer presence, proximity counts and overcrowding incidents")
     parser.add_argument("--event-id", type=str, help="Target event UUID (auto-detected if omitted)")
+    parser.add_argument("--event-name", type=str, help="Target event name (searched or created)")
+    parser.add_argument("--organizer", "--organizer-name", type=str, dest="organizer", help="Organizer name or email (creates new event under this organizer)")
     parser.add_argument("--loop", action="store_true", help="Run in continuous live loop without asking")
     parser.add_argument("--seed-only", action="store_true", help="Seed baseline metrics and exit immediately")
     parser.add_argument("--interval", type=int, default=8, help="Loop tick interval in seconds (default: 8)")
@@ -541,11 +758,20 @@ def main():
     supabase = get_supabase()
 
     # 1. Resolve or Create Event
-    event = resolve_or_create_event(supabase, args.event_id)
+    event = resolve_or_create_event(
+        supabase,
+        target_event_id=args.event_id,
+        target_event_name=args.event_name,
+        target_organizer_query=args.organizer
+    )
     event_id = event["id"]
     event_name = event.get("name", "Spatially Event")
+    organizer_display = event.get("organizer_name")
 
-    print_banner(event_name, event_id)
+    print_banner(event_name, event_id, organizer_display)
+
+    # 1b. Ensure realistic attendee tickets exist for dashboard metrics
+    ensure_event_tickets(supabase, event_id)
 
     # 2. Ensure Zones
     zones = ensure_event_zones(supabase, event_id)
