@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { api } from "../utils/api";
 import { 
   LuRadar, 
@@ -139,15 +139,81 @@ export default function VenueMap({
   // Active layer visibility toggles
   const [showHeatmap, setShowHeatmap] = useState(true);
   const [showVolunteers, setShowVolunteers] = useState(true);
+  const [showMeshGraph, setShowMeshGraph] = useState(true);
   const [showIncidents, setShowIncidents] = useState(true);
 
-  // Interaction states
+  // Interaction states (MUST be declared before graphEdges useMemo)
   const [hoveredZone, setHoveredZone] = useState(null);
   const [hoveredVolunteer, setHoveredVolunteer] = useState(null);
   const [hoveredIncident, setHoveredIncident] = useState(null);
   const [draggedVol, setDraggedVol] = useState(null);
   const [previewPos, setPreviewPos] = useState(null);
   const [draggedZoneIndex, setDraggedZoneIndex] = useState(null);
+
+  // Compute tactical network graph topology between volunteer nodes
+  const graphEdges = useMemo(() => {
+    if (!volPositions || !Array.isArray(volPositions) || volPositions.length < 2) return [];
+    const validNodes = [];
+    volPositions.forEach((v, idx) => {
+      if (!v) return;
+      const isDragged = draggedVol === v.volunteer_user_id;
+      const posX = Number(isDragged && previewPos ? previewPos.x : (v.pos_x ?? 50));
+      const posY = Number(isDragged && previewPos ? previewPos.y : (v.pos_y ?? 50));
+      if (isNaN(posX) || isNaN(posY)) return;
+
+      const cw = containerSize?.w || 800;
+      const ch = containerSize?.h || 520;
+      const x = (posX / 100) * cw;
+      const y = (posY / 100) * ch;
+      const isOvercrowded = Boolean(
+        v.is_overcrowded || 
+        (v.crowd_ratio && v.crowd_ratio >= 0.85) || 
+        v.node_color === "#EF4444"
+      );
+      validNodes.push({
+        id: v.volunteer_user_id || v.shift_id || `vol-${idx}`,
+        x,
+        y,
+        isOvercrowded,
+        name: v.volunteer_name || "Volunteer",
+      });
+    });
+
+    if (validNodes.length < 2) return [];
+
+    const edges = [];
+    const seen = new Set();
+    const k = Math.min(2, validNodes.length - 1);
+
+    for (let i = 0; i < validNodes.length; i++) {
+      const distances = [];
+      for (let j = 0; j < validNodes.length; j++) {
+        if (i === j) continue;
+        const dx = validNodes[i].x - validNodes[j].x;
+        const dy = validNodes[i].y - validNodes[j].y;
+        distances.push({ target: j, dist: Math.hypot(dx, dy) });
+      }
+      distances.sort((a, b) => a.dist - b.dist);
+      for (let m = 0; m < k; m++) {
+        if (!distances[m]) continue;
+        const j = distances[m].target;
+        const key = i < j ? `${i}-${j}` : `${j}-${i}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          const isAlertEdge = Boolean(validNodes[i]?.isOvercrowded || validNodes[j]?.isOvercrowded);
+          edges.push({
+            key,
+            x1: validNodes[i].x,
+            y1: validNodes[i].y,
+            x2: validNodes[j].x,
+            y2: validNodes[j].y,
+            isAlertEdge,
+          });
+        }
+      }
+    }
+    return edges;
+  }, [volPositions, draggedVol, previewPos, containerSize]);
 
   // 1. Fetch Venue Levels
   useEffect(() => {
@@ -430,6 +496,17 @@ export default function VenueMap({
 
           <button
             type="button"
+            className={`btn btn-sm ${showMeshGraph ? "btn-secondary" : "btn-ghost"}`}
+            onClick={() => setShowMeshGraph(!showMeshGraph)}
+            style={{ fontSize: "0.8rem", padding: "4px 8px" }}
+            title="Toggle Volunteer Mesh Network Graph"
+          >
+            <LuLayers size={14} color={showMeshGraph ? "#38BDF8" : "var(--text-muted)"} />
+            <span>Mesh Graph</span>
+          </button>
+
+          <button
+            type="button"
             className={`btn btn-sm ${showIncidents ? "btn-secondary" : "btn-ghost"}`}
             onClick={() => setShowIncidents(!showIncidents)}
             style={{ fontSize: "0.8rem", padding: "4px 8px" }}
@@ -509,6 +586,20 @@ export default function VenueMap({
                 <feMergeNode in="blur" />
                 <feMergeNode in="SourceGraphic" />
               </feMerge>
+            </filter>
+
+            {/* Tactical Volunteer Node Filter */}
+            <filter id="nodeGlow" x="-50%" y="-50%" width="200%" height="200%">
+              <feGaussianBlur stdDeviation="3.5" result="blur" />
+              <feMerge>
+                <feMergeNode in="blur" />
+                <feMergeNode in="SourceGraphic" />
+              </feMerge>
+            </filter>
+
+            {/* Critical Alert Beacon Glow Filter */}
+            <filter id="alertGlow" x="-60%" y="-60%" width="220%" height="220%">
+              <feDropShadow dx="0" dy="0" stdDeviation="6" floodColor="#EF4444" floodOpacity="0.85" />
             </filter>
           </defs>
 
@@ -717,21 +808,82 @@ export default function VenueMap({
             );
           })}
 
-          {/* Volunteer Pins Layer (from volunteer_shifts) */}
+          {/* Tactical Volunteer Mesh Graph Links Layer */}
+          {showVolunteers && showMeshGraph && (
+            <g className="tactical-network-mesh-edges">
+              {graphEdges.map((edge) => (
+                <g key={edge.key}>
+                  {/* Outer glow line for alert edges */}
+                  {edge.isAlertEdge && (
+                    <line
+                      x1={edge.x1}
+                      y1={edge.y1}
+                      x2={edge.x2}
+                      y2={edge.y2}
+                      stroke="#EF4444"
+                      strokeWidth="5"
+                      strokeOpacity="0.25"
+                      strokeLinecap="round"
+                    />
+                  )}
+                  {/* Main tactical dashed link */}
+                  <line
+                    x1={edge.x1}
+                    y1={edge.y1}
+                    x2={edge.x2}
+                    y2={edge.y2}
+                    stroke={edge.isAlertEdge ? "#EF4444" : "rgba(56, 189, 248, 0.45)"}
+                    strokeWidth={edge.isAlertEdge ? 2.5 : 1.6}
+                    className={edge.isAlertEdge ? "tactical-edge-alert" : "tactical-edge-normal"}
+                    strokeLinecap="round"
+                  />
+                  {/* Telemetry packet node at center */}
+                  <circle
+                    cx={(edge.x1 + edge.x2) / 2}
+                    cy={(edge.y1 + edge.y2) / 2}
+                    r={edge.isAlertEdge ? 3.5 : 2.5}
+                    fill={edge.isAlertEdge ? "#EF4444" : "#38BDF8"}
+                    opacity={edge.isAlertEdge ? 0.95 : 0.7}
+                  />
+                </g>
+              ))}
+            </g>
+          )}
+
+          {/* Volunteer Graph Nodes Layer (with dynamic crowd telemetry) */}
           {showVolunteers && volPositions.map((v) => {
             const isDragged = draggedVol === v.volunteer_user_id;
-            const posX = isDragged && previewPos ? previewPos.x : v.pos_x;
-            const posY = isDragged && previewPos ? previewPos.y : v.pos_y;
+            const rawX = isDragged && previewPos ? previewPos.x : v.pos_x;
+            const rawY = isDragged && previewPos ? previewPos.y : v.pos_y;
+            const posX = Number(rawX ?? 50);
+            const posY = Number(rawY ?? 50);
             
-            const dotX = (posX / 100) * containerSize.w;
-            const dotY = (posY / 100) * containerSize.h;
+            const cw = containerSize?.w || 800;
+            const ch = containerSize?.h || 520;
+            const dotX = isNaN(posX) ? cw / 2 : (posX / 100) * cw;
+            const dotY = isNaN(posY) ? ch / 2 : (posY / 100) * ch;
             
             const isSelf = v.volunteer_user_id === currentUserId;
             const isSelected = v.volunteer_user_id === selectedVolunteer;
             const isHovered = hoveredVolunteer === v.volunteer_user_id || isDragged;
             const isOnBreak = v.break_state === "taking_break" || v.break_state === "on_break";
-            const pinColor = isOnBreak ? VOLUNTEER_BREAK_COLOR : (isSelf ? VOLUNTEER_SELF_COLOR : VOLUNTEER_COLOR);
-            const dotR = isSelf ? 8 : 6.5;
+
+            // Live Crowd Proximity Telemetry & Node Color
+            const isOvercrowded = Boolean(
+              v.is_overcrowded || 
+              (v.crowd_ratio && v.crowd_ratio >= 0.85) || 
+              v.node_color === "#EF4444"
+            );
+
+            // Red when overcrowded, amber when elevated (65-85%), blue when moderate (40-65%), green when safe (<40%)
+            const nodeColor = isOvercrowded 
+              ? "#EF4444" 
+              : (v.node_color || (v.crowd_ratio >= 0.65 ? "#F59E0B" : (v.crowd_ratio >= 0.40 ? "#3B82F6" : "#10B981")));
+
+            const dotR = isSelf ? 9.5 : 8.5;
+            const nearbyCount = v.active_count ?? (isOvercrowded ? 172 : 35);
+            const capacity = v.operating_capacity || 100;
+            const pct = Math.round((v.crowd_ratio ? v.crowd_ratio * 100 : (nearbyCount / capacity) * 100));
 
             return (
               <g 
@@ -740,13 +892,41 @@ export default function VenueMap({
                 onMouseLeave={() => setHoveredVolunteer(null)}
                 style={{ cursor: mode === "organizer" ? (isDragged ? "grabbing" : "grab") : "pointer" }}
               >
-                {(isHovered || isSelected) && (
+                {/* 1. Pulsing Radar Ring Beacons (Overcrowded Red Alert) */}
+                {isOvercrowded && (
+                  <>
+                    <circle
+                      cx={dotX}
+                      cy={dotY}
+                      r={36}
+                      fill="rgba(239, 68, 68, 0.16)"
+                      stroke="#EF4444"
+                      strokeWidth="1.8"
+                      strokeDasharray="4 4"
+                      className="alert-beacon-pulse"
+                      pointerEvents="none"
+                    />
+                    <circle
+                      cx={dotX}
+                      cy={dotY}
+                      r={24}
+                      fill="none"
+                      stroke="#EF4444"
+                      strokeWidth="2"
+                      className="ble-radius-pulse"
+                      pointerEvents="none"
+                    />
+                  </>
+                )}
+
+                {/* 2. Soft Tactical Pulse Ring for Normal / Hover Nodes */}
+                {!isOvercrowded && (isHovered || isSelected) && (
                   <circle
                     cx={dotX}
                     cy={dotY}
-                    r={32}
-                    fill="rgba(14, 165, 233, 0.15)"
-                    stroke="rgba(14, 165, 233, 0.6)"
+                    r={28}
+                    fill="rgba(56, 189, 248, 0.15)"
+                    stroke={nodeColor}
                     strokeWidth="1.5"
                     strokeDasharray="4 4"
                     className="ble-radius-pulse"
@@ -754,36 +934,95 @@ export default function VenueMap({
                   />
                 )}
                 
+                {/* 3. Outer Tactical Reticle Ring */}
                 <circle
                   cx={dotX}
                   cy={dotY}
-                  r={isDragged ? dotR * 1.4 : dotR}
-                  fill={pinColor}
+                  r={(isDragged ? dotR * 1.3 : dotR) + 3.5}
+                  fill="none"
+                  stroke={nodeColor}
+                  strokeWidth="1.2"
+                  strokeDasharray={isOvercrowded ? "3 3" : "none"}
+                  opacity="0.8"
+                  pointerEvents="none"
+                />
+
+                {/* 4. Volunteer Node Core Body (Dynamically Colored) */}
+                <circle
+                  cx={dotX}
+                  cy={dotY}
+                  r={isDragged ? dotR * 1.3 : dotR}
+                  fill={nodeColor}
                   stroke="#FFFFFF"
-                  strokeWidth="1.8"
+                  strokeWidth="2"
+                  filter={isOvercrowded ? "url(#alertGlow)" : "url(#nodeGlow)"}
                   onPointerDown={(e) => handlePointerDownVol(e, v.volunteer_user_id, posX, posY)}
                 />
 
-                {/* Volunteer Name Pill */}
-                <text
-                  x={dotX}
-                  y={dotY - (isDragged ? dotR * 1.4 : dotR) - 6}
-                  textAnchor="middle"
-                  fill="#F8FAFC"
-                  fontSize="10"
-                  fontWeight="700"
-                  fontFamily="Inter, sans-serif"
+                {/* 5. Center Tactical Target Dot */}
+                <circle
+                  cx={dotX}
+                  cy={dotY}
+                  r={2.8}
+                  fill="#FFFFFF"
                   pointerEvents="none"
-                  style={{ textShadow: "0 2px 4px rgba(0,0,0,0.9)" }}
-                >
-                  {v.volunteer_name || v.volunteer_user_id?.slice(0, 8)}
-                </text>
+                />
 
-                {/* Break status indicator */}
+                {/* 6. Volunteer Name Pill Tag (Above Node) */}
+                <g transform={`translate(${dotX}, ${dotY - (isDragged ? dotR * 1.3 : dotR) - 10})`} pointerEvents="none">
+                  <rect
+                    x="-44"
+                    y="-14"
+                    width="88"
+                    height="18"
+                    rx="5"
+                    fill="rgba(15, 23, 42, 0.9)"
+                    stroke={nodeColor}
+                    strokeWidth="1"
+                  />
+                  <text
+                    y="-2"
+                    textAnchor="middle"
+                    fill="#F8FAFC"
+                    fontSize="9.5"
+                    fontWeight="700"
+                    fontFamily="Inter, sans-serif"
+                  >
+                    {(v.volunteer_name || "Volunteer").length > 14 
+                      ? (v.volunteer_name || "Volunteer").slice(0, 13) + "…" 
+                      : (v.volunteer_name || "Volunteer")}
+                  </text>
+                </g>
+
+                {/* 7. Live Crowd Count Telemetry Badge (Below Node) */}
+                <g transform={`translate(${dotX}, ${dotY + (isDragged ? dotR * 1.3 : dotR) + 12})`} pointerEvents="none">
+                  <rect
+                    x="-38"
+                    y="-10"
+                    width="76"
+                    height="19"
+                    rx="9.5"
+                    fill={isOvercrowded ? "#EF4444" : "rgba(15, 23, 42, 0.9)"}
+                    stroke={isOvercrowded ? "#FECACA" : nodeColor}
+                    strokeWidth="1.2"
+                  />
+                  <text
+                    y="3.5"
+                    textAnchor="middle"
+                    fill="#FFFFFF"
+                    fontSize="9.5"
+                    fontWeight="800"
+                    fontFamily="Inter, sans-serif"
+                  >
+                    {isOvercrowded ? `⚠️ ${nearbyCount} (${pct}%)` : `👥 ${nearbyCount} (${pct}%)`}
+                  </text>
+                </g>
+
+                {/* 8. Break Status Indicator */}
                 {isOnBreak && (
                   <text
                     x={dotX}
-                    y={dotY + (isDragged ? dotR * 1.4 : dotR) + 12}
+                    y={dotY + (isDragged ? dotR * 1.3 : dotR) + 32}
                     textAnchor="middle"
                     fill="#D8B4FE"
                     fontSize="9"
@@ -795,30 +1034,92 @@ export default function VenueMap({
                     ☕ On Break
                   </text>
                 )}
+
+                {/* 9. Full Tactical HUD Card on Hover */}
+                {isHovered && (
+                  <g transform={`translate(${dotX}, ${dotY - 62})`} style={{ zIndex: 100 }} pointerEvents="none">
+                    <rect
+                      x="-85"
+                      y="-46"
+                      width="170"
+                      height="46"
+                      rx="8"
+                      fill="rgba(10, 15, 30, 0.95)"
+                      stroke={nodeColor}
+                      strokeWidth="1.5"
+                      filter="url(#incidentGlow)"
+                    />
+                    <text
+                      x="0"
+                      y="-30"
+                      textAnchor="middle"
+                      fill="#F8FAFC"
+                      fontSize="11"
+                      fontWeight="700"
+                      fontFamily="Inter, sans-serif"
+                    >
+                      {v.volunteer_name || "Volunteer Node"}
+                    </text>
+                    <text
+                      x="0"
+                      y="-17"
+                      textAnchor="middle"
+                      fill="var(--text-muted)"
+                      fontSize="9.5"
+                      fontWeight="500"
+                      fontFamily="Inter, sans-serif"
+                    >
+                      Sector: {v.zone} {isOnBreak ? "(On Break)" : ""}
+                    </text>
+                    <text
+                      x="0"
+                      y="-4"
+                      textAnchor="middle"
+                      fill={nodeColor}
+                      fontSize="10"
+                      fontWeight="800"
+                      fontFamily="Inter, sans-serif"
+                    >
+                      {isOvercrowded 
+                        ? `CRITICAL OVERCROWDING: ${nearbyCount}/${capacity} (${pct}%)` 
+                        : `Live Crowd: ${nearbyCount}/${capacity} (${pct}%)`}
+                    </text>
+                  </g>
+                )}
               </g>
             );
           })}
         </svg>
       </div>
 
-      {/* Modern Legend Bar */}
+      {/* Modern Tactical Network Legend Bar */}
       <div className="venue-map-legend" style={{ display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: "12px", background: "var(--bg-secondary)", padding: "10px 16px", borderRadius: "8px" }}>
         <div style={{ display: "flex", alignItems: "center", gap: "14px", flexWrap: "wrap" }}>
           <div className="venue-map-legend-title" style={{ fontSize: "0.8rem", color: "var(--text-muted)", display: "flex", alignItems: "center", gap: "6px" }}>
-            <LuUsers size={14} /> Crowd Density:
+            <LuUsers size={14} /> Volunteer Node Density:
           </div>
-          {DENSITY_COLORS.map((tier) => (
-            <div key={tier.label} style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "0.8rem" }}>
-              <span style={{ width: "10px", height: "10px", borderRadius: "50%", backgroundColor: tier.color }} />
-              <span>{tier.label}</span>
-            </div>
-          ))}
+          <div style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "0.8rem" }}>
+            <span style={{ width: "10px", height: "10px", borderRadius: "50%", backgroundColor: "#EF4444" }} />
+            <span>Overcrowded (≥85%)</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "0.8rem" }}>
+            <span style={{ width: "10px", height: "10px", borderRadius: "50%", backgroundColor: "#F59E0B" }} />
+            <span>Busy (65–85%)</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "0.8rem" }}>
+            <span style={{ width: "10px", height: "10px", borderRadius: "50%", backgroundColor: "#3B82F6" }} />
+            <span>Moderate (40–65%)</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "0.8rem" }}>
+            <span style={{ width: "10px", height: "10px", borderRadius: "50%", backgroundColor: "#10B981" }} />
+            <span>Safe (&lt;40%)</span>
+          </div>
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: "16px", fontSize: "0.8rem" }}>
           <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-            <span style={{ width: "10px", height: "10px", borderRadius: "50%", backgroundColor: VOLUNTEER_COLOR }} />
-            <span>Staff</span>
+            <span style={{ width: "18px", height: "2px", borderTop: "2px dashed #38BDF8" }} />
+            <span>Tactical Mesh Link</span>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
             <span style={{ width: "10px", height: "10px", borderRadius: "50%", backgroundColor: VOLUNTEER_BREAK_COLOR }} />
@@ -826,7 +1127,7 @@ export default function VenueMap({
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
             <span style={{ width: "10px", height: "10px", borderRadius: "50%", backgroundColor: "#EF4444" }} />
-            <span>Incident</span>
+            <span>Incident Alert</span>
           </div>
         </div>
       </div>

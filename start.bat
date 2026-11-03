@@ -24,6 +24,9 @@ if /i "%~1"=="stop" (
 )
 if /i "%~1"=="sim" ( set "IS_CLI=1" & goto run_simulation )
 if /i "%~1"=="simulate" ( set "IS_CLI=1" & goto run_simulation )
+if /i "%~1"=="vsim" ( set "IS_CLI=1" & goto run_volunteer_simulation )
+if /i "%~1"=="volunteers" ( set "IS_CLI=1" & goto run_volunteer_simulation )
+if /i "%~1"=="volunteer-sim" ( set "IS_CLI=1" & goto run_volunteer_simulation )
 if /i "%~1"=="attendee" ( set "IS_CLI=1" & goto start_attendee )
 if /i "%~1"=="volunteer" ( set "IS_CLI=1" & goto start_volunteer )
 
@@ -42,11 +45,12 @@ echo   [4] Run Crowd Simulation Harness (simulate_crowd.py)
 echo   [5] Stop running Spatially servers (Kill :8000 and :5173)
 echo   [6] Run Attendee Mobile App (Flutter)
 echo   [7] Run Volunteer Mobile App (Flutter)
+echo   [8] Run Volunteer & Telemetry Demo Simulator (simulate_volunteers.bat)  [DEMO]
 echo   [0] Exit
 echo.
 echo =============================================================
 set "choice="
-set /p choice="Enter choice [0-7] (default 1): "
+set /p choice="Enter choice [0-8] (default 1): "
 
 if "%choice%"=="" set choice=1
 if "%choice%"=="1" goto start_web
@@ -56,10 +60,11 @@ if "%choice%"=="4" goto run_simulation
 if "%choice%"=="5" goto menu_stop_servers
 if "%choice%"=="6" goto start_attendee
 if "%choice%"=="7" goto start_volunteer
+if "%choice%"=="8" goto run_volunteer_simulation
 if "%choice%"=="0" goto exit_script
 
 echo.
-echo [!] Invalid option '%choice%'. Please select between 0 and 7.
+echo [!] Invalid option '%choice%'. Please select between 0 and 8.
 ping 127.0.0.1 -n 3 >nul
 goto menu
 
@@ -275,6 +280,14 @@ if not "%PYTHON_ACTIVATE%"=="" (
 echo [OK] Simulation started in a new terminal window.
 if "%IS_CLI%"=="1" goto exit_script
 pause
+goto menu
+
+:: -------------------------------------------------------------
+:: Action: Run Volunteer & Telemetry Simulation
+:: -------------------------------------------------------------
+:run_volunteer_simulation
+call "%ROOT%simulate_volunteers.bat" %2 %3 %4 %5 %6 %7 %8 %9
+if "%IS_CLI%"=="1" goto exit_script
 goto menu
 
 :: -------------------------------------------------------------
