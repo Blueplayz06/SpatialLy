@@ -1,4 +1,4 @@
-# Spatially
+# SpatialLy
 
 ## Project Overview
 Spatially is an intelligent event operations and spatial crowd monitoring platform connecting attendees, volunteer staff, and event organizers. It combines passive BLE-based proximity awareness, QR ticketing, and comprehensive real-time operational workflows.
